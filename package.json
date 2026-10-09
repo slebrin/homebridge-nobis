@@ -1,0 +1,39 @@
+{
+  "name": "homebridge-nobis",
+  "displayName": "Nobis",
+  "version": "0.1.0-beta.0",
+  "publishConfig": {
+    "access": "public",
+    "tag": "beta",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "description": "Homebridge Dynamic Platform for Nobis-Fi pellet stoves (opt-in experimental read-only temperature sensor; no stove control).",
+  "type": "module",
+  "license": "Apache-2.0",
+  "keywords": ["homebridge-plugin", "supports-hap", "nobis", "agua-iot", "pellet-stove"],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist", "config.schema.json", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE", "docs"],
+  "engines": {
+    "node": "^22.10.0 || ^24.0.0",
+    "homebridge": "^1.8.0 || ^2.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "lint": "eslint . --max-warnings=0",
+    "test": "node --test test/*.test.js",
+    "diagnostic": "node dist/diagnostic-cli.js",
+    "diagnostic:browser": "node dist/diagnostic-browser-cli.js",
+    "check": "npm run build && npm run lint && npm test",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.19.0",
+    "eslint": "^10.9.0",
+    "homebridge": "^1.8.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.1"
+  }
+}

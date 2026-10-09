@@ -1,0 +1,82 @@
+{
+  "pluginAlias": "Nobis",
+  "pluginType": "platform",
+  "singular": true,
+  "strictValidation": true,
+  "schema": {
+    "type": "object",
+    "required": ["email", "password", "pollIntervalSeconds"],
+    "additionalProperties": false,
+    "properties": {
+      "enableCloud": {
+        "title": "Enable read-only cloud discovery",
+        "type": "boolean",
+        "default": false,
+        "description": "Reads devices and register definitions. Buffer readings require the separate temperature sensor option. No stove control."
+      },
+      "enableTemperatureSensor": {
+        "title": "Expose experimental read-only temperature sensor",
+        "type": "boolean",
+        "default": false,
+        "description": "Requires cloud discovery enabled. Reads buffer 1 periodically and exposes only the validated temp_air2_get profile. Cloud measurement freshness is unknown, especially if the thermostat remote is disconnected. No heating state or control."
+      },
+      "name": {
+        "title": "Platform name",
+        "type": "string",
+        "default": "Nobis",
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "email": {
+        "title": "Nobis-Fi email",
+        "type": "string",
+        "format": "email",
+        "pattern": "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$",
+        "description": "Enter your credentials locally only. Never share them in an issue or chat."
+      },
+      "password": {
+        "title": "Nobis-Fi password",
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S",
+        "description": "Masked in the UI, but not encrypted in Homebridge configuration. Protect the storage and backups."
+      },
+      "stoveName": {
+        "title": "Stove display name (optional)",
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S",
+        "description": "Display name only; not used to identify the stove."
+      },
+      "deviceId": {
+        "title": "Stove device ID (optional)",
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S",
+        "description": "Leave unset for a single stove. For multiple stoves, select its id_device from locally inspected API data; do not publish it."
+      },
+      "pollIntervalSeconds": {
+        "title": "Refresh interval (seconds)",
+        "type": "integer",
+        "default": 60,
+        "minimum": 30,
+        "maximum": 3600,
+        "multipleOf": 1,
+        "description": "Read-only discovery / enabled temperature reading interval. These bounds are plugin policy, not documented Agua-IoT quotas."
+      },
+      "diagnostic": {
+        "title": "Safe diagnostic logging",
+        "type": "boolean",
+        "default": false,
+        "description": "Operation timings and safe error codes. Never includes credentials, tokens or raw responses."
+      }
+    }
+  },
+  "layout": [
+    {
+      "type": "section",
+      "title": "Experimental read-only validation — no stove control",
+      "items": ["enableCloud", "enableTemperatureSensor", "name", "email", { "key": "password", "type": "password" }, "stoveName", "deviceId", { "key": "pollIntervalSeconds", "type": "number" }, "diagnostic"]
+    }
+  ]
+}

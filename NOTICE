@@ -1,0 +1,10 @@
+homebridge-nobis
+
+Development scaffold adapted from homebridge/homebridge-plugin-template,
+revision ab217b1ff36fbbf69931822324e1986113cd9d81 (Apache License 2.0).
+https://github.com/homebridge/homebridge-plugin-template
+
+Changes: Nobis platform registration, configuration validation, optional
+read-only cloud discovery, independent Agua-IoT client, opt-in local diagnostic,
+no example accessories or custom services, development documentation and
+automated tests.
