@@ -1,7 +1,7 @@
 {
   "name": "homebridge-nobis",
   "displayName": "Nobis",
-  "version": "0.1.0-beta.27",
+  "version": "0.1.0-beta.28",
   "publishConfig": {
     "access": "public",
     "tag": "beta",

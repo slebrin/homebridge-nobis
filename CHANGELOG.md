@@ -4,6 +4,16 @@ Les mentions « preparee, non publiee » decrivent la preparation locale,
 pas un inventaire a jour de npm. Verifier les tags et versions publies
 avant une release ; aucune publication n'est realisee par ces notes.
 
+## 0.1.0-beta.28 — publiee sur npm le 2026-11-03
+
+- Nouveau numero pour publier l'etat actuel du depot : npm contient deja
+  0.1.0-beta.27 et interdit de remplacer une version publiee.
+- Aucun changement fonctionnel par rapport au commit 7804229 de la release
+  GitHub v0.1.0-beta.27 ; fonctions et validations detaillees ci-dessous.
+- Publication npm verifiee : le tag beta pointe sur 0.1.0-beta.28.
+  Le gitHead declare par npm est 7804229 ; les changements de version et
+  de documentation sont enregistres dans le commit de release suivant.
+
 ## 0.1.0-beta.27 — preparee le 2026-11-03, non publiee
 
 - Ajoute uniquement un ContactSensor Eco Stop optionnel, desactive par

@@ -4,7 +4,7 @@ Plugin Homebridge pour les poeles Nobis-Fi, communiquant directement avec
 le cloud Agua-IoT. Premier appareil teste : **Nobis A8 V Round**.
 Pas de MQTT, Home Assistant, conteneur ou passerelle supplementaire requis.
 
-**Version experimentale : `0.1.0-beta.27`. Ce plugin n'est pas Verified by
+**Version experimentale : `0.1.0-beta.28`. Ce plugin n'est pas Verified by
 Homebridge.** Les retours sur un A8 ne garantissent pas la compatibilite
 avec les autres modeles. Utiliser les commandes sous surveillance et suivre
 les consignes du fabricant ; ne pas utiliser le plugin comme dispositif
