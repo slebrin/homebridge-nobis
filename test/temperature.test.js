@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { decodeNobisAmbientTemperature } from '../dist/agua/temperature.js';
+import { TemperatureAccessory } from '../dist/temperature-accessory.js';
+import { HomebridgeAPI } from './homebridge-api.js';
 
 const register = {
   reg_key: 'temp_air2_get', reg_type: 'GET', offset: 103, mask: 65535,
@@ -10,6 +12,34 @@ const register = {
 const map = { id: 'fictitious-map', registers: [register] };
 const reading = value => ({ values: new Map([[103, value], [104, 255]]), receivedAt: 123456 });
 const failure = kind => error => error.kind === kind && error.operation === 'ambient-temperature';
+
+test('ambient tile can be removed and restored without changing stove identity or other services', async () => {
+  const api = new HomebridgeAPI();
+  const accessory = new api.platformAccessory('Test', api.hap.uuid.generate('ambient-migration'));
+  const uuid = accessory.UUID;
+  const heating = accessory.addService(api.hap.Service.Thermostat, 'Heating', 'heating');
+  const power = accessory.addService(api.hap.Service.Switch, 'Power', 'power');
+  const temperature = { celsius: 23, receivedAt: 123, freshness: 'unknown' };
+  for (const separate of [true, false, false, true, true]) {
+    const sensor = new TemperatureAccessory(accessory, api, 'Test', separate);
+    sensor.update(temperature);
+    const service = accessory.getService(api.hap.Service.TemperatureSensor);
+    if (separate) {
+      assert.equal(await service.getCharacteristic(api.hap.Characteristic.CurrentTemperature).handleGetRequest(), 23);
+      assert.equal(accessory.services.filter(item => item.UUID === api.hap.Service.TemperatureSensor.UUID).length, 1);
+    } else {
+      assert.equal(service, undefined);
+    }
+    assert.equal(accessory.UUID, uuid);
+    assert.equal(accessory.getServiceById(api.hap.Service.Thermostat, 'heating'), heating);
+    assert.equal(accessory.getServiceById(api.hap.Service.Switch, 'power'), power);
+    assert.throws(() => sensor.update({ ...temperature, celsius: NaN }));
+    sensor.markUnavailable();
+    if (separate) {
+      await assert.rejects(service.getCharacteristic(api.hap.Characteristic.CurrentTemperature).handleGetRequest());
+    }
+  }
+});
 
 test('ambient temperature uses only the validated word value and retains unknown freshness', () => {
   for (const value of [0, 18, 23, 256, 65535]) {

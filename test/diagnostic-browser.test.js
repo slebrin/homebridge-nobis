@@ -11,6 +11,690 @@ import { startDiagnosticBrowser } from '../dist/diagnostic-browser.js';
 import { diagnosticScript } from '../dist/diagnostic-page.js';
 import { describeResponseShape, observeBufferIndexes, observeNackCode } from '../dist/diagnostic-shape.js';
 
+const powerRegisters = [
+  { reg_key: 'status_get', reg_type: 'GET', offset: 8, mask: 65535, formula: '#',
+    enc_val: [{ value: 0, lang: 'FRE', description: 'OFF' }, { value: 5, lang: 'FRE', description: 'TRAVAIL' },
+      { value: 8, lang: 'FRE', description: 'ECO STOP' }] },
+  { reg_key: 'status_managed_get', reg_type: 'GET', readonly: false, offset: 232, mask: 255,
+    formula: '#', formula_inverse: '#', set_min: 0, set_max: 255, step: 1,
+    is_word: false, big_endian: false, with_sign: false,
+    enc_val: [{ value: 85, lang: 'FRE', description: 'ON' }, { value: 170, lang: 'FRE', description: 'OFF' }] },
+];
+
+const ventilationRegisters = [
+  ...powerRegisters,
+  ...[
+    ['power_set', 33120, 1, 7], ['vent_front_set', 33132, 0, 8],
+    ['fun_auto_set', 33128, 0, 1], ['fun_pwf_set', 33154, 0, 1],
+  ].map(([reg_key, offset, set_min, set_max]) => ({
+    reg_key, reg_type: 'SET', offset, set_min, set_max, mask: 65535,
+    formula: '#', formula_inverse: '#', readonly: false, step: 1,
+    is_word: true, big_endian: false, with_sign: false,
+    ...(reg_key === 'vent_front_set' ? { enc_val: [
+      { value: 0, lang: 'FRE', description: 'OFF' }, { value: 8, lang: 'FRE', description: 'PS' },
+    ] } : {}),
+  })),
+];
+
+test('manual ventilation is confirmed, protected, single-write and never repeats HTTP/network/Nack failures', async context => {
+  for (const failure of ['none', '401', 'network', 'nack', 'readback']) {
+    const mock = mockedClient({
+      '/deviceGetRegistersMap': { Success: true, device_registers_map: {
+        registers_map: [{ id: 'private-map', registers: ventilationRegisters }],
+      } },
+      '/deviceGetBufferReading': { Success: true, idRequest: 'read' },
+      '/deviceJobStatus/read': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: { Items: [8, 232, 33120, 33132, 33128, 33154], Values: [0, 0, 5, 4, 0, 0] } },
+      '/deviceRequestWriting': { Success: true, idRequest: 'write' },
+      '/deviceJobStatus/write': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: failure === 'nack' ? { NackErrCode: 0 } : {} },
+    });
+    const writes = [];
+    let reads = 0;
+    const local = await setup(context, { jobPollIntervalMs: 1, fetch: (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/deviceGetBufferReading' && ++reads === 2 && failure === 'readback') {
+        throw new Error('private');
+      }
+      if (path === '/deviceRequestWriting') {
+        writes.push(JSON.parse(init.body));
+        if (failure === '401') {
+          return Promise.resolve(new globalThis.Response('{}', { status: 401 }));
+        }
+        if (failure === 'network') {
+          throw new Error('private');
+        }
+      }
+      return mock.fetch(url, init);
+    } });
+    for (const input of [{ level: 3 }, { level: 0, confirmVentilationChange: true },
+      { level: 8, confirmVentilationChange: true }, { level: '3', confirmVentilationChange: true }]) {
+      assert.equal((await local.post({ ...credentials, ...input }, {}, '/ventilation-test')).status, 400);
+    }
+    const input = { ...credentials, level: 3, confirmVentilationChange: true };
+    assert.equal((await local.post(input, { 'X-Nobis-Token': 'wrong' }, '/ventilation-test')).status, 403);
+    assert.equal(mock.calls.length, 0);
+    const response = await local.post(input, {}, '/ventilation-test');
+    const data = await response.json();
+    assert.equal(response.status, failure === 'none' ? 200 : 502);
+    assert.deepEqual(writes, [{
+      id_device: 'private-device', id_product: 'private-product', Protocol: 'RWMSmaster',
+      BitData: 8, Endianess: 'L', Items: [33132], Masks: [65535], Values: [3],
+    }]);
+    if (failure === 'none') {
+      assert.equal(data.originalLevel, 4);
+      assert.equal(data.requestedLevel, 3);
+      assert.equal(data.after.registers[1].rawValue, 4);
+      assert.equal(data.physicalEffectVerified, false);
+      assert.equal(reads, 4);
+      assert.equal(data.observations.length, 3);
+      assert.equal(data.readbackMatches, false);
+    } else {
+      assert.match(data.error, /aucune repetition ni restauration automatiques/);
+    }
+    assert.equal(JSON.stringify(data).includes('private'), false);
+  }
+});
+
+test('ventilation page requires per-click confirmation and never mistakes mismatched readback for physical success', async () => {
+  const settings = {
+    receivedAt: 123, freshness: 'unknown', controlValidated: false,
+    registers: [
+      { key: 'power_set', offset: 33120, rawValue: 5, label: null },
+      { key: 'vent_front_set', offset: 33132, rawValue: 4, label: null },
+      { key: 'fun_auto_set', offset: 33128, rawValue: 0, label: 'OFF' },
+      { key: 'fun_pwf_set', offset: 33154, rawValue: 0, label: 'OFF' },
+    ],
+  };
+  let data = { originalLevel: 4, requestedLevel: 3, before: settings, after: settings,
+    physicalEffectVerified: false, freshnessVerified: false, observations: [settings], readbackMatches: false };
+  let calls = 0;
+  const page = pageHarness(async (path, init) => {
+    assert.equal(path, '/ventilation-test');
+    assert.equal(JSON.parse(init.body).confirmVentilationChange, true);
+    calls++;
+    return { ok: true, json: async () => data };
+  });
+
+  page.elements.operation.value = 'ventilation';
+  page.elements.operation.listeners.change();
+  page.elements['ventilation-target'].value = '3';
+  await page.submit();
+  assert.equal(calls, 0);
+  page.elements['ventilation-confirm'].checked = true;
+  await page.submit();
+  assert.equal(calls, 1);
+  assert.equal(page.elements['ventilation-confirm'].checked, false);
+  assert.equal(page.elements.password.value, '');
+  assert.equal(page.elements['ventilation-result'].hidden, false);
+  assert.match(page.elements.result.textContent, /ne renvoyez pas/);
+  page.elements['clear-ventilation'].listeners.click();
+  assert.equal(page.elements['ventilation-values'].textContent, '');
+  data = { ...data, physicalEffectVerified: true };
+  page.elements.password.value = credentials.password;
+  page.elements['ventilation-confirm'].checked = true;
+  await page.submit();
+  assert.equal(page.elements['ventilation-result'].hidden, true);
+  assert.match(page.elements.result.textContent, /Ne repetez pas/);
+});
+
+test('manual ventilation refuses unsupported initial conditions and unchanged levels before any write', async context => {
+  for (const values of [
+    [8, 0, 5, 4, 0, 0], [0, 0, 5, 4, 1, 0], [0, 0, 5, 4, 0, 1],
+    [0, 0, 5, 8, 0, 0], [0, 0, 5, 3, 0, 0],
+  ]) {
+    const mock = mockedClient({
+      '/deviceGetRegistersMap': { Success: true, device_registers_map: {
+        registers_map: [{ id: 'private-map', registers: ventilationRegisters }],
+      } },
+      '/deviceGetBufferReading': { Success: true, idRequest: 'read' },
+      '/deviceJobStatus/read': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: { Items: [8, 232, 33120, 33132, 33128, 33154], Values: values } },
+    });
+    const local = await setup(context, { fetch: mock.fetch, jobPollIntervalMs: 1 });
+    const response = await local.post({ ...credentials, level: 3, confirmVentilationChange: true }, {}, '/ventilation-test');
+    assert.equal(response.status, 502);
+    assert.match((await response.json()).error, /Commande non envoyee/);
+    assert.equal(mock.calls.includes('/deviceRequestWriting'), false);
+  }
+});
+
+test('manual heating power level requires confirmation, writes only 33120 once and never retries failures', async context => {
+  for (const failure of ['none', 'matched', '401', 'network', 'nack', 'readback', 'invalid-json', 'timeout']) {
+    let reads = 0;
+    const replies = {
+      '/deviceGetRegistersMap': { Success: true, device_registers_map: {
+        registers_map: [{ id: 'private-map', registers: ventilationRegisters }],
+      } },
+      '/deviceGetBufferReading': { Success: true, idRequest: 'read' },
+      '/deviceJobStatus/read': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: { Items: [8, 232, 33120, 33132, 33128, 33154],
+          Values: [0, 0, 5, 4, 0, 0] } },
+      '/deviceRequestWriting': { Success: true, idRequest: 'write' },
+      '/deviceJobStatus/write': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: failure === 'nack' ? { NackErrCode: 0 } : {} },
+    };
+    const mock = mockedClient(replies);
+    const writes = [];
+    const local = await setup(context, { jobPollIntervalMs: 1, timeoutMs: 1000, fetch: (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/deviceGetBufferReading' && ++reads === 2 && failure === 'readback') {
+        throw new Error('private');
+      }
+      if (reads === 2 && failure === 'matched') {
+        replies['/deviceJobStatus/read'].jobAnswerData.Values[2] = 3;
+      }
+      if (path === '/deviceRequestWriting') {
+        writes.push(JSON.parse(init.body));
+        if (failure === '401') {
+          return Promise.resolve(new globalThis.Response('{}', { status: 401 }));
+        }
+        if (failure === 'network') {
+          throw new Error('private');
+        }
+        if (failure === 'invalid-json') {
+          return Promise.resolve(new globalThis.Response('not JSON'));
+        }
+        if (failure === 'timeout') {
+          return new Promise((_resolve, reject) =>
+            init.signal.addEventListener('abort', () => reject(new Error('private')), { once: true }));
+        }
+      }
+      return mock.fetch(url, init);
+    } });
+    for (const input of [{ level: 3 }, { level: 0, confirmPowerLevelChange: true },
+      { level: 8, confirmPowerLevelChange: true }, { level: '3', confirmPowerLevelChange: true },
+      { level: 3, confirmVentilationChange: true }]) {
+      assert.equal((await local.post({ ...credentials, ...input }, {}, '/power-level-test')).status, 400);
+    }
+    const input = { ...credentials, level: 3, confirmPowerLevelChange: true };
+    assert.equal((await local.post(input, { 'X-Nobis-Token': 'wrong' }, '/power-level-test')).status, 403);
+    assert.equal(mock.calls.length, 0);
+    const response = await local.post(input, {}, '/power-level-test');
+    const data = await response.json();
+    assert.equal(response.status, ['none', 'matched'].includes(failure) ? 200 : 502);
+    assert.deepEqual(writes, [{
+      id_device: 'private-device', id_product: 'private-product', Protocol: 'RWMSmaster',
+      BitData: 8, Endianess: 'L', Items: [33120], Masks: [65535], Values: [3],
+    }]);
+    if (response.status === 200) {
+      assert.equal(data.originalLevel, 5);
+      assert.equal(data.requestedLevel, 3);
+      assert.equal(data.after.registers[0].rawValue, failure === 'matched' ? 3 : 5);
+      assert.equal(data.physicalEffectVerified, false);
+      assert.equal(data.freshnessVerified, false);
+      assert.equal(reads, failure === 'matched' ? 2 : 4);
+      assert.equal(data.observations.length, failure === 'matched' ? 1 : 3);
+      assert.equal(data.readbackMatches, failure === 'matched');
+    } else {
+      assert.match(data.error, /aucune repetition ni restauration automatiques/);
+    }
+    assert.equal(mock.calls.filter(path => path === '/userLogin').length, 1);
+    assert.equal(JSON.stringify(data).includes('private'), false);
+  }
+});
+
+test('heating power level refuses unsupported initial conditions and unchanged targets before sending', async context => {
+  for (const values of [
+    [8, 0, 5, 4, 0, 0], [2, 0, 5, 4, 0, 0], [0, 0, 5, 4, 1, 0],
+    [0, 0, 5, 4, 0, 1], [0, 0, 3, 4, 0, 0], [0, 0, 8, 4, 0, 0],
+  ]) {
+    const mock = mockedClient({
+      '/deviceGetRegistersMap': { Success: true, device_registers_map: {
+        registers_map: [{ id: 'private-map', registers: ventilationRegisters }],
+      } },
+      '/deviceGetBufferReading': { Success: true, idRequest: 'read' },
+      '/deviceJobStatus/read': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: { Items: [8, 232, 33120, 33132, 33128, 33154], Values: values } },
+    });
+    const local = await setup(context, { fetch: mock.fetch, jobPollIntervalMs: 1 });
+    const response = await local.post({ ...credentials, level: 3, confirmPowerLevelChange: true }, {}, '/power-level-test');
+    assert.equal(response.status, 502);
+    assert.equal(mock.calls.includes('/deviceRequestWriting'), false);
+  }
+});
+
+test('heating power level page confirms per click, clears secrets and distinguishes API readback from physical success', async () => {
+  const settings = {
+    receivedAt: 123, freshness: 'unknown', controlValidated: false,
+    registers: [
+      { key: 'power_set', offset: 33120, rawValue: 5, label: null },
+      { key: 'vent_front_set', offset: 33132, rawValue: 4, label: null },
+      { key: 'fun_auto_set', offset: 33128, rawValue: 0, label: 'OFF' },
+      { key: 'fun_pwf_set', offset: 33154, rawValue: 0, label: 'OFF' },
+    ],
+  };
+  let data = { originalLevel: 5, requestedLevel: 3, before: settings, after: settings,
+    physicalEffectVerified: false, freshnessVerified: false, observations: [settings], readbackMatches: false };
+  let calls = 0;
+  const page = pageHarness(async (path, init) => {
+    assert.equal(path, '/power-level-test');
+    const input = JSON.parse(init.body);
+    assert.equal(input.confirmPowerLevelChange, true);
+    assert.equal(input.confirmVentilationChange, undefined);
+    calls++;
+    return { ok: true, json: async () => data };
+  });
+  page.elements.operation.value = 'power-level';
+  page.elements.operation.listeners.change();
+  assert.equal(page.elements['ventilation-controls'].hidden, false);
+  page.elements['ventilation-target'].value = '3';
+  await page.submit();
+  assert.equal(calls, 0);
+  page.elements['ventilation-confirm'].checked = true;
+  await page.submit();
+  assert.equal(calls, 1);
+  assert.equal(page.elements.password.value, '');
+  assert.equal(page.elements['ventilation-confirm'].checked, false);
+  assert.match(page.elements.result.textContent, /ne renvoyez pas/);
+  assert.match(page.elements['ventilation-values'].textContent, /Puissance de chauffe/);
+  data = { ...data, after: { ...settings, registers: settings.registers.map((entry, i) =>
+    i === 0 ? { ...entry, rawValue: 3 } : entry) } };
+  data = { ...data, observations: [data.after], readbackMatches: true };
+  page.elements.password.value = credentials.password;
+  page.elements['ventilation-confirm'].checked = true;
+  await page.submit();
+  assert.match(page.elements.result.textContent, /concordante, effet physique NON confirme/);
+  data = { ...data, physicalEffectVerified: true };
+  page.elements.password.value = credentials.password;
+  page.elements['ventilation-confirm'].checked = true;
+  await page.submit();
+  assert.equal(page.elements['ventilation-result'].hidden, true);
+  assert.match(page.elements.result.textContent, /Ne repetez pas/);
+  page.elements['ventilation-confirm'].checked = true;
+  page.elements.operation.value = 'ventilation';
+  page.elements.operation.listeners.change();
+  assert.equal(page.elements['ventilation-confirm'].checked, false);
+});
+
+for (const mode of ['auto', 'powerful']) {
+test(`manual ${mode} writes one register with independent confirmation and no retry on failures`, async context => {
+  const key = mode === 'auto' ? 'fun_auto_set' : 'fun_pwf_set';
+  const index = mode === 'auto' ? 4 : 5;
+  const offset = mode === 'auto' ? 33128 : 33154;
+  const confirmation = mode === 'auto' ? 'confirmAutoChange' : 'confirmPowerfulChange';
+  const route = '/' + mode + '-test';
+  const registers = ventilationRegisters.map(entry => entry.reg_key === key ? {
+    ...entry, enc_val: [{ value: 0, lang: 'FRE', description: 'OFF' }, { value: 1, lang: 'FRE', description: 'ON' }],
+  } : entry);
+  for (const [enabled, failure] of [
+    [true, 'matched'], [false, 'matched'], [true, 'delayed'], [true, 'different'], [true, '401'],
+    [true, 'network'], [true, 'nack'], [true, 'readback'], [true, 'invalid-json'], [true, 'timeout'],
+  ]) {
+    let reads = 0;
+    const original = enabled ? 0 : 1;
+    const replies = {
+      '/deviceGetRegistersMap': { Success: true, device_registers_map: {
+        registers_map: [{ id: 'private-map', registers }],
+      } },
+      '/deviceGetBufferReading': { Success: true, idRequest: 'read' },
+      '/deviceJobStatus/read': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: { Items: [8, 232, 33120, 33132, 33128, 33154],
+          Values: [0, 0, 5, 4, mode === 'auto' ? original : 0, mode === 'powerful' ? original : 0] } },
+      '/deviceRequestWriting': { Success: true, idRequest: 'write' },
+      '/deviceJobStatus/write': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: failure === 'nack' ? { NackErrCode: 0 } : {} },
+    };
+    const mock = mockedClient(replies);
+    const writes = [];
+    const local = await setup(context, { jobPollIntervalMs: 1, timeoutMs: 1000, fetch: (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/deviceGetBufferReading' && ++reads >= 2) {
+        if (failure === 'readback') {
+          throw new Error('private');
+        }
+        if (failure === 'matched' || (failure === 'delayed' && reads === 3)) {
+          replies['/deviceJobStatus/read'].jobAnswerData.Values[index] = Number(enabled);
+        }
+      }
+      if (path === '/deviceRequestWriting') {
+        writes.push(JSON.parse(init.body));
+        if (failure === '401') {
+          return Promise.resolve(new globalThis.Response('{}', { status: 401 }));
+        }
+        if (failure === 'network') {
+          throw new Error('private');
+        }
+        if (failure === 'invalid-json') {
+          return Promise.resolve(new globalThis.Response('invalid JSON'));
+        }
+        if (failure === 'timeout') {
+          return new Promise((_resolve, reject) =>
+            init.signal.addEventListener('abort', () => reject(new Error('private')), { once: true }));
+        }
+      }
+      return mock.fetch(url, init);
+    } });
+    for (const input of [{ enabled }, { enabled: 1, [confirmation]: true },
+      { enabled: 'on', [confirmation]: true }, { enabled, confirmPowerChange: true }]) {
+      assert.equal((await local.post({ ...credentials, ...input }, {}, route)).status, 400);
+    }
+    const input = { ...credentials, enabled, [confirmation]: true };
+    assert.equal((await local.post(input, { 'X-Nobis-Token': 'wrong' }, route)).status, 403);
+    assert.equal(mock.calls.length, 0);
+    const response = await local.post(input, {}, route);
+    const data = await response.json();
+    assert.equal(response.status, ['matched', 'delayed', 'different'].includes(failure) ? 200 : 502);
+    assert.deepEqual(writes, [{
+      id_device: 'private-device', id_product: 'private-product', Protocol: 'RWMSmaster',
+      BitData: 8, Endianess: 'L', Items: [offset], Masks: [65535], Values: [Number(enabled)],
+    }]);
+    if (response.status === 200) {
+      assert.equal(data.originalEnabled, !enabled);
+      assert.equal(data.requestedEnabled, enabled);
+      const matched = failure === 'matched' || failure === 'delayed';
+      assert.equal(data.after.registers[index - 2].rawValue, matched ? Number(enabled) : original);
+      assert.equal(data.physicalEffectVerified, false);
+      assert.equal(data.freshnessVerified, false);
+      assert.equal(reads, failure === 'matched' ? 2 : failure === 'delayed' ? 3 : 4);
+      assert.equal(data.observations.length, reads - 1);
+      assert.equal(data.readbackMatches, matched);
+    } else {
+      assert.match(data.error, /aucune repetition ni restauration automatiques/);
+    }
+    assert.equal(mock.calls.filter(path => path === '/userLogin').length, 1);
+    assert.equal(JSON.stringify(data).includes('private'), false);
+  }
+});
+}
+
+test('Powerful route refuses Auto active, transitions, CRONO, unchanged targets and wrong confirmation', async context => {
+  for (const [phase, auto, powerful] of [[7, 0, 0], [2, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, 2]]) {
+    const mock = mockedClient({
+      '/deviceGetRegistersMap': { Success: true, device_registers_map: {
+        registers_map: [{ id: 'private-map', registers: ventilationRegisters.map(entry =>
+          entry.reg_key === 'fun_pwf_set' ? { ...entry, enc_val: [
+            { value: 0, lang: 'FRE', description: 'OFF' }, { value: 1, lang: 'FRE', description: 'ON' },
+            { value: 2, lang: 'FRE', description: 'CRONO' },
+          ] } : entry) }],
+      } },
+      '/deviceGetBufferReading': { Success: true, idRequest: 'read' },
+      '/deviceJobStatus/read': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: { Items: [8, 232, 33120, 33132, 33128, 33154], Values: [phase, 0, 5, 4, auto, powerful] } },
+    });
+    const local = await setup(context, { fetch: mock.fetch, jobPollIntervalMs: 1 });
+    assert.equal((await local.post({ ...credentials, enabled: true, confirmAutoChange: true }, {}, '/powerful-test')).status, 400);
+    assert.equal(mock.calls.length, 0);
+    assert.equal((await local.post({ ...credentials, enabled: true, confirmPowerfulChange: true }, {}, '/powerful-test')).status, 502);
+    assert.equal(mock.calls.includes('/deviceRequestWriting'), false);
+  }
+});
+
+test('Powerful page uses its own confirmation, actual readback and resets selection when changing modes', async () => {
+  const settings = {
+    receivedAt: 123, freshness: 'unknown', controlValidated: false,
+    registers: [
+      { key: 'power_set', offset: 33120, rawValue: 5, label: null },
+      { key: 'vent_front_set', offset: 33132, rawValue: 4, label: null },
+      { key: 'fun_auto_set', offset: 33128, rawValue: 0, label: 'OFF' },
+      { key: 'fun_pwf_set', offset: 33154, rawValue: 0, label: 'OFF' },
+    ],
+  };
+  let data = { originalEnabled: false, requestedEnabled: true, before: settings, after: settings,
+    observations: [settings], readbackMatches: false, physicalEffectVerified: false, freshnessVerified: false };
+  let calls = 0;
+  const page = pageHarness(async (path, init) => {
+    assert.equal(path, '/powerful-test');
+    const input = JSON.parse(init.body);
+    assert.equal(input.confirmPowerfulChange, true);
+    assert.equal(input.confirmAutoChange, undefined);
+    assert.equal(input.enabled, true);
+    calls++;
+    return { ok: true, json: async () => data };
+  });
+  page.elements.operation.value = 'powerful';
+  page.elements.operation.listeners.change();
+  assert.equal(page.elements['auto-controls'].hidden, false);
+  await page.submit();
+  assert.equal(calls, 0);
+  page.elements['auto-target'].value = 'on';
+  page.elements['auto-confirm'].checked = true;
+  await page.submit();
+  assert.equal(calls, 1);
+  assert.equal(page.elements.password.value, '');
+  assert.equal(page.elements['auto-confirm'].checked, false);
+  assert.match(page.elements.result.textContent, /Powerful relu different/);
+  const after = { ...settings, registers: settings.registers.map((entry, index) =>
+    index === 3 ? { ...entry, rawValue: 1, label: 'ON' } : entry) };
+  data = { ...data, after, observations: [after], readbackMatches: true };
+  page.elements.password.value = credentials.password;
+  page.elements['auto-confirm'].checked = true;
+  await page.submit();
+  assert.match(page.elements.result.textContent, /Powerful relu concordant, effet physique NON confirme/);
+  data = { ...data, observations: [settings] };
+  page.elements.password.value = credentials.password;
+  page.elements['auto-confirm'].checked = true;
+  await page.submit();
+  assert.equal(page.elements['ventilation-result'].hidden, true);
+  assert.match(page.elements.result.textContent, /Powerful peut avoir ete applique/);
+  page.elements.operation.value = 'auto';
+  page.elements.operation.listeners.change();
+  assert.equal(page.elements['auto-target'].value, '');
+  assert.equal(page.elements['auto-confirm'].checked, false);
+});
+
+test('Auto initial-state and exact labels refuse invalid requests before writing', async context => {
+  for (const [phase, auto, powerful, labels = [
+    { value: 0, lang: 'FRE', description: 'OFF' }, { value: 1, lang: 'FRE', description: 'ON' },
+  ]] of [[7, 0, 0], [2, 0, 0], [0, 0, 1], [0, 1, 0], [0, 0, 0, []]]) {
+    const mock = mockedClient({
+      '/deviceGetRegistersMap': { Success: true, device_registers_map: {
+        registers_map: [{ id: 'private-map', registers: ventilationRegisters.map(entry =>
+          entry.reg_key === 'fun_auto_set' ? { ...entry, enc_val: labels } : entry) }],
+      } },
+      '/deviceGetBufferReading': { Success: true, idRequest: 'read' },
+      '/deviceJobStatus/read': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: { Items: [8, 232, 33120, 33132, 33128, 33154], Values: [phase, 0, 5, 4, auto, powerful] } },
+    });
+    const local = await setup(context, { fetch: mock.fetch, jobPollIntervalMs: 1 });
+    assert.equal((await local.post({ ...credentials, enabled: true, confirmAutoChange: true }, {}, '/auto-test')).status, 502);
+    assert.equal(mock.calls.includes('/deviceRequestWriting'), false);
+  }
+});
+
+test('Auto page requires an explicit boolean choice and confirmation, clears secrets and preserves uncertainty', async () => {
+  const settings = {
+    receivedAt: 123, freshness: 'unknown', controlValidated: false,
+    registers: [
+      { key: 'power_set', offset: 33120, rawValue: 5, label: null },
+      { key: 'vent_front_set', offset: 33132, rawValue: 4, label: null },
+      { key: 'fun_auto_set', offset: 33128, rawValue: 0, label: 'OFF' },
+      { key: 'fun_pwf_set', offset: 33154, rawValue: 0, label: 'OFF' },
+    ],
+  };
+  let data = { originalEnabled: false, requestedEnabled: true, before: settings, after: settings,
+    physicalEffectVerified: false, freshnessVerified: false, observations: [settings], readbackMatches: false };
+  let calls = 0;
+  const page = pageHarness(async (path, init) => {
+    assert.equal(path, '/auto-test');
+    const input = JSON.parse(init.body);
+    assert.equal(input.confirmAutoChange, true);
+    assert.equal(input.enabled, true);
+    assert.equal(input.confirmPowerChange, undefined);
+    calls++;
+    return { ok: true, json: async () => data };
+  });
+  page.elements.operation.value = 'auto';
+  page.elements.operation.listeners.change();
+  assert.equal(page.elements['auto-controls'].hidden, false);
+  page.elements['auto-confirm'].checked = true;
+  await page.submit();
+  assert.equal(calls, 0);
+  page.elements['auto-target'].value = 'on';
+  page.elements['auto-confirm'].checked = false;
+  await page.submit();
+  assert.equal(calls, 0);
+  page.elements['auto-confirm'].checked = true;
+  await page.submit();
+  assert.equal(calls, 1);
+  assert.equal(page.elements.password.value, '');
+  assert.equal(page.elements['auto-confirm'].checked, false);
+  assert.match(page.elements.result.textContent, /Auto relu different/);
+  assert.match(page.elements['ventilation-values'].textContent, /fun_auto_set=0/);
+  data = { ...data, after: { ...settings, registers: settings.registers.map((entry, i) =>
+    i === 2 ? { ...entry, rawValue: 1, label: 'ON' } : entry) } };
+  data = { ...data, observations: [data.after], readbackMatches: true };
+  page.elements.password.value = credentials.password;
+  page.elements['auto-confirm'].checked = true;
+  await page.submit();
+  assert.match(page.elements.result.textContent, /concordant, effet physique NON confirme/);
+  assert.match(page.elements['ventilation-values'].textContent, /Relectures : #1 1/);
+  for (const invalid of [
+    { ...data, observations: [] }, { ...data, observations: Array(4).fill(data.after) },
+    { ...data, observations: [settings] }, { ...data, readbackMatches: false },
+    { ...data, observations: [data.after, data.after] },
+  ]) {
+    const valid = data;
+    data = invalid;
+    page.elements.password.value = credentials.password;
+    page.elements['auto-confirm'].checked = true;
+    await page.submit();
+    assert.equal(page.elements['ventilation-result'].hidden, true);
+    assert.match(page.elements.result.textContent, /Ne repetez pas/);
+    data = valid;
+  }
+  data = { ...data, physicalEffectVerified: true };
+  page.elements.password.value = credentials.password;
+  page.elements['auto-confirm'].checked = true;
+  await page.submit();
+  assert.equal(page.elements['ventilation-result'].hidden, true);
+  assert.match(page.elements.result.textContent, /Ne repetez pas/);
+  page.elements['auto-confirm'].checked = true;
+  page.elements.operation.value = 'settings-read';
+  page.elements.operation.listeners.change();
+  assert.equal(page.elements['auto-confirm'].checked, false);
+});
+
+test('manual power requires confirmation, sends one map-derived write and never retries ambiguous failures', async context => {
+  for (const [action, failure, initialPhase = action === 'on' ? 0 : 5] of [
+    ['on', 'none'], ['off', 'none'], ['on', '401'], ['on', 'network'], ['on', 'nack'], ['on', 'readback'],
+    ['off', 'none', 8], ['off', '401', 8], ['off', 'network', 8], ['off', 'nack', 8],
+  ]) {
+    const replies = {
+      '/deviceGetRegistersMap': { Success: true, device_registers_map: {
+        registers_map: [{ id: 'private-map', registers: powerRegisters }],
+      } },
+      '/deviceGetBufferReading': { Success: true, idRequest: 'read' },
+      '/deviceJobStatus/read': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: { Items: [8, 232], Values: [initialPhase, 0] } },
+      '/deviceRequestWriting': { Success: true, idRequest: 'write' },
+      '/deviceJobStatus/write': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: failure === 'nack' ? { NackErrCode: 0 } : {} },
+    };
+    const mock = mockedClient(replies);
+    const writes = [];
+    let reads = 0;
+    const local = await setup(context, { jobPollIntervalMs: 1, fetch: (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/deviceGetBufferReading' && ++reads === 2 && failure === 'readback') {
+        throw new Error('private readback failure');
+      }
+      if (path === '/deviceRequestWriting') {
+        writes.push(JSON.parse(init.body));
+        if (failure === '401') {
+          return Promise.resolve(new globalThis.Response('{}', { status: 401 }));
+        }
+        if (failure === 'network') {
+          throw new Error('private write failure');
+        }
+      }
+      return mock.fetch(url, init);
+    } });
+    for (const input of [{ ...credentials, action: 'on' },
+      { ...credentials, action: 'invalid', confirmPowerChange: true },
+      { ...credentials, action: ['on'], confirmPowerChange: true }]) {
+      assert.equal((await local.post(input, {}, '/power-test')).status, 400);
+    }
+    assert.equal(mock.calls.length, 0);
+    assert.equal((await local.post({ ...credentials, action: 'on', confirmPowerChange: true },
+      { 'X-Nobis-Token': 'wrong' }, '/power-test')).status, 403);
+    const response = await local.post({ ...credentials, action, confirmPowerChange: true }, {}, '/power-test');
+    const data = await response.json();
+    assert.equal(response.status, failure === 'none' ? 200 : 502);
+    assert.equal(writes.length, 1);
+    assert.deepEqual(writes[0], {
+      id_device: 'private-device', id_product: 'private-product',
+      Protocol: 'RWMSmaster', BitData: 8, Endianess: 'L', Items: [232], Masks: [255], Values: [action === 'on' ? 85 : 170],
+    });
+    if (failure === 'none') {
+      assert.equal(data.before.phase.kind, initialPhase === 8 ? 'eco-stop' : action === 'on' ? 'off' : 'working');
+      assert.equal(data.after.phase.kind, data.before.phase.kind);
+      assert.equal(data.physicalEffectVerified, false);
+      assert.equal(data.freshnessVerified, false);
+      assert.equal(reads, 2);
+    } else {
+      assert.match(data.error, /Effet physique non confirme/);
+    }
+    assert.equal(JSON.stringify(data).includes('private'), false);
+  }
+});
+
+test('power requests from unknown or transitional phases and incompatible masks never send a command', async context => {
+  for (const [code, action, mask] of [[0, 'off', 255], [5, 'on', 255], [2, 'on', 255], [7, 'off', 255], [0, 'on', 65535]]) {
+    const mock = mockedClient({
+      '/deviceGetRegistersMap': { Success: true, device_registers_map: {
+        registers_map: [{ id: 'private-map', registers: [powerRegisters[0], { ...powerRegisters[1], mask }] }],
+      } },
+      '/deviceGetBufferReading': { Success: true, idRequest: 'read' },
+      '/deviceJobStatus/read': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: { Items: [8, 232], Values: [code, 0] } },
+    });
+    const local = await setup(context, { fetch: mock.fetch, jobPollIntervalMs: 1 });
+    assert.equal((await local.post({ ...credentials, action, confirmPowerChange: true }, {}, '/power-test')).status, 502);
+    assert.equal(mock.calls.includes('/deviceRequestWriting'), false);
+  }
+});
+
+test('power page requires physical confirmation, resets it and preserves uncertainty for unchanged readback', async () => {
+  let calls = 0;
+  let ok = true;
+  const observation = { receivedAt: 123, freshness: 'unknown', phase: { kind: 'off', code: 0 } };
+  const page = pageHarness(async (path, init) => {
+    calls++;
+    assert.equal(path, '/power-test');
+    assert.equal(JSON.parse(init.body).confirmPowerChange, true);
+    return { ok, json: async () => ok ? {
+      action: 'on', mask: 255, before: observation, after: observation,
+      physicalEffectVerified: false, freshnessVerified: false,
+    } : { error: 'Effet physique non confirme' } };
+  });
+  page.elements.operation.value = 'power';
+  page.elements.operation.listeners.change();
+  page.elements['power-action'].value = 'on';
+  await page.submit();
+  assert.equal(calls, 0);
+  page.elements['power-confirm'].checked = true;
+  await page.submit();
+  assert.equal(calls, 1);
+  assert.equal(page.elements['power-confirm'].checked, false);
+  assert.equal(page.elements.password.value, '');
+  assert.equal(page.elements['power-result'].hidden, false);
+  assert.match(page.elements.result.textContent, /NON confirme/);
+  assert.match(page.elements['power-values'].textContent, /Avant : 0.*\nApres : 0/);
+  ok = false;
+  page.elements.password.value = credentials.password;
+  page.elements['power-confirm'].checked = true;
+  await page.submit();
+  assert.equal(page.elements['power-result'].hidden, true);
+  assert.equal(page.elements['power-values'].textContent, '');
+});
+
+test('power page accepts an OFF job from ECO STOP without claiming its unchanged phase confirms extinction', async () => {
+  const observation = { receivedAt: 123, freshness: 'unknown', phase: { kind: 'eco-stop', code: 8 } };
+  const page = pageHarness(async () => ({ ok: true, json: async () => ({
+    action: 'off', mask: 255, before: observation, after: observation,
+    physicalEffectVerified: false, freshnessVerified: false,
+  }) }));
+  page.elements.operation.value = 'power';
+  page.elements.operation.listeners.change();
+  page.elements['power-action'].value = 'off';
+  page.elements['power-confirm'].checked = true;
+  await page.submit();
+  assert.equal(page.elements['power-result'].hidden, false);
+  assert.match(page.elements['power-values'].textContent, /Avant : 8 \(eco-stop\)/);
+  assert.match(page.elements.result.textContent, /NON confirme/);
+});
+
 async function setup(context, clientOptions = {}, options = {}) {
   const root = await mkdtemp(join(tmpdir(), 'nobis-browser-test-'));
   const browser = await startDiagnosticBrowser(root, { clientOptions, ...options });
@@ -33,6 +717,383 @@ const ambientRegister = {
   reg_key: 'temp_air2_get', reg_type: 'GET', offset: 103, mask: 65535,
   formula: '#', is_word: true, big_endian: false, with_sign: false,
 };
+
+const setpointRegister = {
+  reg_key: 'temp_air_set', reg_type: 'SET', readonly: false, offset: 33122,
+  mask: 65535, formula: '#', formula_inverse: '#', set_min: 7, set_max: 41,
+  step: 1, is_word: true, big_endian: false, with_sign: false,
+  enc_val: [{ value: 41, lang: 'FRE', description: 'MAN' }],
+};
+
+test('operating settings route reads once with writes disabled and fails explicitly for incompatible profiles', async context => {
+  for (const incompatible of [false, true]) {
+    const registers = [
+      ['power_set', 33120, 1, 7], ['vent_front_set', 33132, 0, 8],
+      ['fun_auto_set', 33128, 0, 1], ['fun_pwf_set', 33154, 0, 1],
+    ].map(([reg_key, offset, set_min, set_max]) => ({
+      reg_key, reg_type: 'SET', offset, set_min, set_max, mask: incompatible ? 255 : 65535,
+      formula: '#', formula_inverse: '#', readonly: false, step: 1,
+      is_word: true, big_endian: false, with_sign: false,
+    }));
+    const mock = mockedClient({
+      '/deviceGetRegistersMap': { Success: true, device_registers_map: {
+        registers_map: [{ id: 'private-map', registers }],
+      } },
+      '/deviceGetBufferReading': { Success: true, idRequest: 'read' },
+      '/deviceJobStatus/read': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: { Items: [33120, 33132, 33128, 33154], Values: [5, 4, 0, 0] } },
+    });
+    const local = await setup(context, {
+      fetch: mock.fetch, jobPollIntervalMs: 1, enableExperimentalPower: true, enableExperimentalSetpoint: true,
+      enableExperimentalPowerLevel: true,
+      enableExperimentalAuto: true,
+    });
+    assert.equal((await local.post(credentials, { 'X-Nobis-Token': 'wrong' }, '/settings-read')).status, 403);
+    assert.equal(mock.calls.length, 0);
+    const response = await local.post({ ...credentials, action: 'on', confirmPowerChange: true,
+      celsius: 28, confirmSetpointChange: true, level: 3, confirmPowerLevelChange: true,
+      enabled: true, confirmAutoChange: true }, {}, '/settings-read');
+    assert.equal(response.status, incompatible ? 502 : 200);
+    const data = await response.json();
+    if (!incompatible) {
+      assert.equal(data.settings.controlValidated, false);
+      assert.deepEqual(data.settings.registers.map(x => x.rawValue), [5, 4, 0, 0]);
+    } else {
+      assert.match(data.error, /operating-settings/);
+    }
+    assert.equal(JSON.stringify(data).includes('private'), false);
+    assert.equal(mock.calls.includes('/deviceRequestWriting'), false);
+    assert.equal(mock.calls.filter(path => path === '/deviceGetBufferReading').length, 1);
+  }
+});
+
+test('settings page renders candidates as text and clears stale values on error or malformed responses', async () => {
+  const settings = {
+    receivedAt: 123, freshness: 'unknown', controlValidated: false,
+    registers: [
+      { key: 'power_set', offset: 33120, rawValue: 5, label: null },
+      { key: 'vent_front_set', offset: 33132, rawValue: 8, label: '<script>PS</script>' },
+      { key: 'fun_auto_set', offset: 33128, rawValue: 0, label: 'OFF' },
+      { key: 'fun_pwf_set', offset: 33154, rawValue: 0, label: 'OFF' },
+    ],
+  };
+  let data = { bufferId: 1, settings };
+  let ok = true;
+  const page = pageHarness(async path => {
+    assert.equal(path, '/settings-read');
+    return { ok, json: async () => data };
+  });
+  page.elements.operation.value = 'settings-read';
+  page.elements.operation.listeners.change();
+  assert.match(page.elements.connect.textContent, /sans commande/);
+  await page.submit();
+  assert.equal(page.elements.password.value, '');
+  assert.equal(page.elements['settings-reading'].hidden, false);
+  assert.match(page.elements['settings-reading-value'].textContent, /<script>PS<\/script>/);
+  page.elements['clear-settings-reading'].listeners.click();
+  assert.equal(page.elements['settings-reading-value'].textContent, '');
+  for (const invalid of [
+    { ...settings, controlValidated: true }, { ...settings, receivedAt: -1 },
+    { ...settings, registers: settings.registers.slice(1) },
+    { ...settings, registers: settings.registers.map(x => ({ ...x, rawValue: 9 })) },
+    { ...settings, registers: settings.registers.map(x => ({ ...x, label: {} })) },
+  ]) {
+    data = { bufferId: 1, settings: invalid };
+    page.elements.password.value = credentials.password;
+    await page.submit();
+    assert.equal(page.elements['settings-reading'].hidden, true);
+    assert.equal(page.elements['settings-reading-value'].textContent, '');
+  }
+  ok = false;
+  data = { error: 'Explicit failure' };
+  page.elements.password.value = credentials.password;
+  await page.submit();
+  assert.equal(page.elements.result.textContent, 'Explicit failure');
+  assert.equal(page.elements['settings-reading'].hidden, true);
+});
+
+test('status route reads buffer one once and keeps unknown codes without enabling writes', async context => {
+  const mock = mockedClient({
+    '/deviceGetRegistersMap': { Success: true, device_registers_map: {
+      registers_map: [{ id: 'private-map', registers: [
+        { reg_key: 'status_get', reg_type: 'GET', offset: 8, mask: 65535, formula: '#',
+          enc_val: [{ value: 0, lang: 'FRE', description: 'OFF' }] },
+        { reg_key: 'status_managed_get', reg_type: 'GET', offset: 232, mask: 255, formula: '#',
+          enc_val: [{ value: 85, lang: 'FRE', description: 'ON' }] },
+      ] }],
+    } },
+    '/deviceGetBufferReading': { Success: true, idRequest: 'read' },
+    '/deviceJobStatus/read': { Success: true, jobAnswerStatus: 'completed',
+      jobAnswerData: { Items: [8, 232, 103], Values: [0, 0, 23] } },
+  });
+  const local = await setup(context, {
+    fetch: mock.fetch, jobPollIntervalMs: 1, enableExperimentalSetpoint: true, enableExperimentalPower: true,
+    enableExperimentalVentilation: true, enableExperimentalPowerLevel: true,
+  });
+  assert.equal((await local.post(credentials, { 'X-Nobis-Token': 'wrong' }, '/status-read')).status, 403);
+  assert.equal(mock.calls.length, 0);
+  const response = await local.post({ ...credentials, confirmSetpointChange: true, celsius: 28 }, {}, '/status-read');
+  assert.equal(response.status, 200);
+  const data = await response.json();
+  assert.equal(data.bufferId, 1);
+  assert.equal(data.status.freshness, 'unknown');
+  assert.deepEqual(data.status.phase, { kind: 'off', code: 0 });
+  assert.equal(data.status.registers[0].label, 'OFF');
+  assert.equal(data.status.registers[1].label, null);
+  assert.equal(JSON.stringify(data).includes('private'), false);
+  assert.equal('values' in data, false);
+  assert.equal(mock.calls.includes('/deviceRequestWriting'), false);
+  assert.equal(mock.calls.filter(path => path === '/deviceGetBufferReading').length, 1);
+});
+
+test('status page renders labels as text and clears on error, invalid response or explicit action', async () => {
+  let response = { ok: true, json: async () => ({ bufferId: 1, status: {
+    receivedAt: 123, freshness: 'unknown',
+    phase: { kind: 'unknown', code: 0, reason: 'label-mismatch' },
+    registers: [
+      { key: 'status_get', offset: 8, rawValue: 0, label: '<script>OFF</script>' },
+      { key: 'status_managed_get', offset: 232, rawValue: 0, label: null },
+    ],
+  } }) };
+  const page = pageHarness(async path => {
+    assert.equal(path, '/status-read');
+    return response;
+  });
+  page.elements.operation.value = 'status-read';
+  page.elements.operation.listeners.change();
+  await page.submit();
+  assert.match(page.elements['status-reading-value'].textContent, /<script>OFF<\/script>/);
+  assert.match(page.elements['status-reading-value'].textContent, /INCONNU/);
+  assert.equal(page.elements['status-reading'].hidden, false);
+  assert.equal(page.elements['setpoint-controls'].hidden, true);
+  page.elements['clear-status-reading'].listeners.click();
+  assert.equal(page.elements['status-reading-value'].textContent, '');
+  for (const next of [
+    { ok: false, json: async () => ({ error: 'Lecture refusee' }) },
+    { ok: true, json: async () => ({ bufferId: 1, status: {} }) },
+  ]) {
+    response = next;
+    page.elements.password.value = credentials.password;
+    await page.submit();
+    assert.equal(page.elements['status-reading'].hidden, true);
+    assert.equal(page.elements['status-reading-value'].textContent, '');
+    assert.equal(page.elements.password.value, '');
+    assert.match(page.elements.result.textContent, /Lecture refusee|reponse invalide/);
+  }
+});
+
+test('status page distinguishes all compared phases and rejects inconsistent phase payloads without stale display', async () => {
+  let status;
+  const page = pageHarness(async () => ({ ok: true, json: async () => ({ bufferId: 1, status }) }));
+  page.elements.operation.value = 'status-read';
+  page.elements.operation.listeners.change();
+  const sample = (code, label, phase) => ({
+    receivedAt: 123, freshness: 'unknown', phase,
+    registers: [
+      { key: 'status_get', offset: 8, rawValue: code, label },
+      { key: 'status_managed_get', offset: 232, rawValue: 0, label: null },
+    ],
+  });
+  for (const [code, label, kind, expected] of [
+    [0, 'OFF', 'off', /Eteint/],
+    [2, 'D\u00c9BUT', 'starting', /Demarrage/],
+    [5, 'TRAVAIL', 'working', /Phase observee : Travail/],
+    [7, 'ARR\u00caT', 'stopping', /Arret en cours \(pas encore OFF\)/],
+    [8, 'ECO STOP', 'eco-stop', /Pause ECO STOP \(activation conservee\)/],
+    [9, 'STAND BY', 'unknown', /NON VALIDEE SUR APPAREIL/],
+  ]) {
+    status = sample(code, label, { kind, code, ...(kind === 'unknown' ? { reason: 'unvalidated-code' } : {}) });
+    page.elements.password.value = credentials.password;
+    await page.submit();
+    assert.equal(page.elements['status-reading'].hidden, false);
+    assert.match(page.elements['status-reading-value'].textContent, expected);
+  }
+  for (const invalid of [
+    sample(7, 'ARR\u00caT', { kind: 'off', code: 7 }),
+    sample(0, 'TRAVAIL', { kind: 'off', code: 0 }),
+    sample(5, 'TRAVAIL', { kind: 'working', code: 0 }),
+    sample(5, 'TRAVAIL', { kind: 'unknown', code: 5, reason: 'unvalidated-code' }),
+    sample(5, 'TRAVAIL', { kind: 'unknown', code: 5, reason: 'label-mismatch' }),
+    sample(8, 'ECO STOP', { kind: 'unknown', code: 8, reason: 'label-mismatch' }),
+    sample(8, 'ECO STOP', { kind: 'unknown', code: 8, reason: 'unvalidated-code' }),
+    sample(8, 'OFF', { kind: 'eco-stop', code: 8 }),
+    sample(0, 'OFF', { kind: '__proto__', code: 0 }),
+    sample(0, 'OFF', undefined),
+  ]) {
+    status = invalid;
+    page.elements.password.value = credentials.password;
+    await page.submit();
+    assert.equal(page.elements['status-reading'].hidden, true);
+    assert.equal(page.elements['status-reading-value'].textContent, '');
+    assert.match(page.elements.result.textContent, /reponse invalide/);
+  }
+});
+
+test('read-only setpoint route never enables writes and exposes temperature or MAN without other readings', async context => {
+  for (const value of [18, 41]) {
+    const mock = mockedClient({
+      '/deviceGetRegistersMap': { Success: true, device_registers_map: {
+        registers_map: [{ id: 'private-map', registers: [setpointRegister] }],
+      } },
+      '/deviceGetBufferReading': { Success: true, idRequest: 'read' },
+      '/deviceJobStatus/read': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: { Items: [33122, 103], Values: [value, 23] } },
+    });
+    const local = await setup(context, { fetch: mock.fetch, jobPollIntervalMs: 1 });
+    assert.equal((await local.post(credentials, { 'X-Nobis-Token': 'wrong' }, '/setpoint-read')).status, 403);
+    assert.equal(mock.calls.length, 0);
+    const response = await local.post({ ...credentials, confirmSetpointChange: true, celsius: 28 }, {}, '/setpoint-read');
+    assert.equal(response.status, 200);
+    const data = await response.json();
+    assert.equal(data.setpoint.mode, value === 41 ? 'manual' : 'temperature');
+    assert.equal(data.setpoint.celsius, value === 41 ? undefined : value);
+    assert.equal(data.setpoint.freshness, 'unknown');
+    assert.equal(JSON.stringify(data).includes('private'), false);
+    assert.equal('values' in data, false);
+    assert.equal(mock.calls.includes('/deviceRequestWriting'), false);
+    assert.equal(mock.calls.filter(path => path === '/deviceGetBufferReading').length, 1);
+  }
+});
+
+test('read-only setpoint page shows MAN without degrees and clears prior values on failure', async () => {
+  let ok = true;
+  let setpoint = { mode: 'manual', freshness: 'unknown', receivedAt: 123 };
+  const page = pageHarness(async path => {
+    assert.equal(path, '/setpoint-read');
+    return { ok, json: async () => ok ? { bufferId: 1, setpoint } : { error: 'Lecture refusee' } };
+  });
+  page.elements.operation.value = 'setpoint-read';
+  page.elements.operation.listeners.change();
+  await page.submit();
+  assert.match(page.elements['setpoint-reading-value'].textContent, /pas 41 degres/);
+  assert.equal(page.elements['setpoint-controls'].hidden, true);
+  page.elements['clear-setpoint-reading'].listeners.click();
+  assert.equal(page.elements['setpoint-reading'].hidden, true);
+  setpoint = { mode: 'temperature', celsius: 18, freshness: 'unknown', receivedAt: 123 };
+  page.elements.password.value = credentials.password;
+  await page.submit();
+  assert.match(page.elements['setpoint-reading-value'].textContent, /18 degres/);
+  ok = false;
+  page.elements.password.value = credentials.password;
+  await page.submit();
+  assert.equal(page.elements['setpoint-reading-value'].textContent, '');
+  assert.equal(page.elements['setpoint-reading'].hidden, true);
+  assert.equal(page.elements.result.textContent, 'Lecture refusee');
+});
+
+test('manual setpoint test requires explicit confirmation and sends one exact write followed by a separate read', async context => {
+  for (const observed of [19, 20]) {
+    const replies = {
+      '/deviceGetRegistersMap': { Success: true, device_registers_map: {
+        registers_map: [{ id: 'private-map', registers: [setpointRegister] }],
+      } },
+      '/deviceGetBufferReading': { Success: true, idRequest: 'read' },
+      '/deviceJobStatus/read': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: { Items: [33122], Values: [20] } },
+      '/deviceRequestWriting': { Success: true, idRequest: 'write' },
+      '/deviceJobStatus/write': { Success: true, jobAnswerStatus: 'completed', jobAnswerData: {} },
+    };
+    const mock = mockedClient(replies);
+    let reads = 0;
+    const writes = [];
+    const local = await setup(context, { jobPollIntervalMs: 1, fetch: (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/deviceGetBufferReading' && ++reads === 2) {
+        replies['/deviceJobStatus/read'].jobAnswerData.Values = [observed];
+      }
+      if (path === '/deviceRequestWriting') {
+        writes.push(JSON.parse(init.body));
+      }
+      return mock.fetch(url, init);
+    } });
+    for (const input of [
+      { ...credentials, celsius: 19 },
+      { ...credentials, celsius: 41, confirmSetpointChange: true },
+    ]) {
+      assert.equal((await local.post(input, {}, '/setpoint-test')).status, 400);
+    }
+    assert.equal(mock.calls.length, 0);
+    assert.equal((await local.post({ ...credentials, celsius: 19, confirmSetpointChange: true },
+      { Origin: 'https://attacker.example' }, '/setpoint-test')).status, 403);
+    const response = await local.post({ ...credentials, celsius: 19, confirmSetpointChange: true }, {}, '/setpoint-test');
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.originalCelsius, 20);
+    assert.equal(result.observedCelsius, observed);
+    assert.equal(result.readbackMatches, observed === 19);
+    assert.equal(result.freshnessVerified, false);
+    assert.deepEqual(writes, [{
+      id_device: 'private-device', id_product: 'private-product',
+      Protocol: 'RWMSmaster', BitData: 8, Endianess: 'L', Items: [33122], Masks: [65535], Values: [19],
+    }]);
+    assert.equal(reads, observed === 19 ? 2 : 4);
+    assert.equal(JSON.stringify(result).includes('private'), false);
+    assert.deepEqual(await readdir(join(local.root, 'homebridge-nobis')), ['app-id']);
+  }
+});
+
+test('manual writes are not repeated on 401, network ambiguity or Nack including zero', async context => {
+  for (const failure of ['401', 'network', 'nack']) {
+    const mock = mockedClient({
+      '/deviceGetRegistersMap': { Success: true, device_registers_map: {
+        registers_map: [{ id: 'private-map', registers: [setpointRegister] }],
+      } },
+      '/deviceGetBufferReading': { Success: true, idRequest: 'read' },
+      '/deviceJobStatus/read': { Success: true, jobAnswerStatus: 'completed',
+        jobAnswerData: { Items: [33122], Values: [20] } },
+      '/deviceRequestWriting': { Success: true, idRequest: 'write' },
+      '/deviceJobStatus/write': { Success: true, jobAnswerStatus: 'completed', jobAnswerData: { NackErrCode: 0 } },
+    });
+    let writes = 0;
+    const local = await setup(context, { jobPollIntervalMs: 1, fetch: (url, init) => {
+      if (new URL(url).pathname === '/deviceRequestWriting') {
+        writes++;
+        if (failure === '401') {
+          return new globalThis.Response(JSON.stringify({ Success: false }), { status: 401 });
+        }
+        if (failure === 'network') {
+          throw new Error('private-network');
+        }
+      }
+      return mock.fetch(url, init);
+    } });
+    const response = await local.post({ ...credentials, celsius: 19, confirmSetpointChange: true }, {}, '/setpoint-test');
+    assert.equal(response.status, 502);
+    const result = await response.json();
+    assert.match(result.error, /indetermine/);
+    assert.match(result.error, /restaurez/);
+    assert.equal('readbackMatches' in result, false);
+    assert.equal(writes, 1);
+    assert.equal(mock.calls.includes('/refreshToken'), false);
+    assert.equal(mock.calls.filter(path => path === '/deviceGetBufferReading').length, 1);
+  }
+});
+
+test('setpoint page requires confirmation per click and distinguishes readback mismatch', async () => {
+  let calls = 0;
+  const page = pageHarness(async path => {
+    calls++;
+    assert.equal(path, '/setpoint-test');
+    return { ok: true, json: async () => ({
+      originalCelsius: 20, requestedCelsius: 19, observedCelsius: 20,
+      readbackMatches: false, freshnessVerified: false,
+    }) };
+  });
+  page.elements.operation.value = 'setpoint';
+  page.elements.operation.listeners.change();
+  page.elements['setpoint-target'].value = '19';
+  await page.submit();
+  assert.equal(calls, 0);
+  page.elements['setpoint-confirm'].checked = true;
+  await page.submit();
+  assert.equal(calls, 1);
+  assert.equal(page.elements['setpoint-confirm'].checked, false);
+  assert.match(page.elements.result.textContent, /ne correspond PAS/);
+  assert.equal(page.elements.password.value, '');
+  page.elements['clear-setpoint'].listeners.click();
+  assert.equal(page.elements['setpoint-result'].hidden, true);
+  assert.equal(page.elements['setpoint-values'].textContent, '');
+});
 
 function temperatureReplies(register = ambientRegister, values = [23, 0]) {
   return {
@@ -387,6 +1448,13 @@ function pageHarness(fetcher) {
     'configuration', 'configuration-shape', 'clear-configuration', 'nack-code', 'buffer-indexes',
     'raw-reading', 'raw-values', 'raw-received', 'clear-raw',
     'temperature', 'temperature-value', 'temperature-received', 'clear-temperature',
+    'setpoint-controls', 'setpoint-target', 'setpoint-confirm', 'setpoint-result', 'setpoint-values', 'clear-setpoint',
+    'setpoint-reading', 'setpoint-reading-value', 'clear-setpoint-reading',
+    'status-reading', 'status-reading-value', 'clear-status-reading',
+    'settings-reading', 'settings-reading-value', 'clear-settings-reading',
+    'power-controls', 'power-action', 'power-confirm', 'power-result', 'power-values', 'clear-power',
+    'ventilation-controls', 'ventilation-target', 'ventilation-confirm', 'ventilation-result', 'ventilation-values', 'clear-ventilation',
+    'auto-controls', 'auto-target', 'auto-confirm',
     'reading-failure', 'reading-structure', 'clear-failure'];
   const elements = Object.fromEntries(ids.map(id => [id, element()]));
   elements.email.value = credentials.email;

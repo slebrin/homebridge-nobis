@@ -6,6 +6,7 @@ export type AguaPath =
   | '/deviceGetInfo' | '/deviceGetRegistersMap' | '/deviceGetBufferReading'
   | '/deviceGetConfigBuffer'
   | '/devicegetBufferId'
+  | '/deviceRequestWriting'
   | `/deviceJobStatus/${string}`;
 
 export interface RequestOptions {
@@ -24,6 +25,13 @@ export interface Diagnostic {
 }
 
 export interface TransportOptions {
+  readonly enableExperimentalSetpoint?: boolean;
+  readonly enableExperimentalPower?: boolean;
+  readonly enableExperimentalVentilation?: boolean;
+  readonly enableExperimentalPowerLevel?: boolean;
+  readonly enableExperimentalAuto?: boolean;
+  readonly enableExperimentalChrono?: boolean;
+  readonly enableExperimentalPowerful?: boolean;
   readonly fetch?: typeof fetch;
   readonly timeoutMs?: number;
   readonly maxResponseBytes?: number;
@@ -68,7 +76,12 @@ export class AguaTransport {
 
   async request(path: AguaPath, options: RequestOptions = {}): Promise<Record<string, unknown>> {
     const isJob = /^\/deviceJobStatus\/[A-Za-z0-9_-]+$/.test(path);
-    if (!PATHS.has(path) && !isJob) {
+    if (!PATHS.has(path) && !isJob
+      && !(path === '/deviceRequestWriting'
+        && (this.options.enableExperimentalSetpoint === true || this.options.enableExperimentalPower === true
+          || this.options.enableExperimentalVentilation === true || this.options.enableExperimentalPowerLevel === true
+          || this.options.enableExperimentalAuto === true || this.options.enableExperimentalPowerful === true
+          || this.options.enableExperimentalChrono === true))) {
       throw new AguaError('configuration', 'path');
     }
     const operation = isJob ? 'deviceJobStatus' : path.slice(1);

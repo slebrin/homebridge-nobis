@@ -1,475 +1,274 @@
 # homebridge-nobis
 
-Plugin Homebridge open source en cours de developpement pour les poeles
-Nobis-Fi / Agua-IoT. Premier modele cible : Nobis A8 V Round.
+Plugin Homebridge pour les poeles Nobis-Fi, communiquant directement avec
+le cloud Agua-IoT. Premier appareil teste : **Nobis A8 V Round**.
+Pas de MQTT, Home Assistant, conteneur ou passerelle supplementaire requis.
 
-**Etat actuel : client en lecture seule et capteur HomeKit de temperature
-experimental, optionnel. Aucun controle ni etat de chauffage expose.
-La temperature a ete comparee sur l'appareil cible ; la compatibilite complete
-et la fraicheur des mesures ne sont pas garanties.
-Ce plugin n'est pas Verified by Homebridge.**
+**Version experimentale : `0.1.0-beta.27`. Ce plugin n'est pas Verified by
+Homebridge.** Les retours sur un A8 ne garantissent pas la compatibilite
+avec les autres modeles. Utiliser les commandes sous surveillance et suivre
+les consignes du fabricant ; ne pas utiliser le plugin comme dispositif
+de securite ou pour des automatismes critiques.
 
-## Architecture
+## Fonctions dans Apple Maison
 
-Socle derive du [template officiel Homebridge](https://github.com/homebridge/homebridge-plugin-template/tree/ab217b1ff36fbbf69931822324e1986113cd9d81),
-sous forme de Dynamic Platform TypeScript. Les accessoires d'exemple et la
-dependance aux services personnalises du template ne sont pas repris.
+| Fonction | Comportement |
+| --- | --- |
+| Temperature ambiante | Lecture cloud ; tuile separee seulement sans Chauffage |
+| Marche/arret | Commande reelle du poele, avec etat confirme par lecture |
+| Chauffage et consigne | Thermostat, ou HeaterCooler si ventilation activee ; consigne 7-40 C |
+| Ventilation | Niveau demande 1-7, pas une mesure de debit |
+| Auto / Powerful | Interrupteurs de modes, pas commandes de marche/arret |
+| Programme / Chrono | Active/desactive les horaires existants, sans les editer |
+| En chauffe | Option transformant le switch Marche en indicateur de TRAVAIL |
+| Eco Stop | Capteur de contact optionnel en lecture seule |
 
-- `src/index.ts` : enregistrement de la plateforme.
-- `src/settings.ts` : identifiants stables et constantes.
-- `src/config.ts` : configuration typee et validation.
-- `src/platform.ts` : cycle Homebridge et cache des accessoires.
-- `src/agua/client.ts` : operations en lecture seule, mutualisation et jobs.
-- `src/agua/auth.ts` : inscription d'application, login et renouvellement.
-- `src/agua/transport.ts` : HTTPS, timeout, taille bornee, erreurs et diagnostic.
-- `src/agua/models.ts` : validation des reponses inconnues.
-- `src/agua/temperature.ts` : decodage pur de la temperature ambiante observee,
-  sans garantie de fraicheur ni exposition HomeKit.
-- `src/temperature-accessory.ts` : capteur TemperatureSensor, GET local et
-  defaut de communication explicite.
-- `src/agua/errors.ts` : erreurs explicites sans valeurs sensibles.
-- `src/agua/identity.ts` : UUID d'application prive et persistant.
-- `src/diagnostic.ts` et `src/diagnostic-cli.ts` : diagnostic local autonome,
-  hors ligne par defaut, sans dependance runtime a Homebridge.
-- `src/diagnostic-browser.ts`, `src/diagnostic-browser-cli.ts` et
-  `src/diagnostic-page.ts` : interface navigateur locale du diagnostic.
-- `config.schema.json` : interface Plugin Settings GUI.
-- `test/` : tests fictifs, sans connexion a un poele.
+L'utilisateur a confirme sur son A8 la temperature, les commandes
+marche/arret et consigne, Auto, Powerful, Programme, l'affichage de
+ventilation et les indicateurs En chauffe et Eco Stop. Cela ne valide pas
+tous les niveaux de ventilation, toutes les phases ou l'execution des
+horaires. Les preuves detaillees figurent dans l'[etude API](docs/ETUDE-API.md).
 
-Le controle HomeKit attend la validation des commandes et etats du modele cible.
-Voir [l'etude API](docs/ETUDE-API.md) pour les preuves et inconnues.
+### Etats et limites
 
-## Developpement local
+Les phases reconnues sont OFF, DEBUT, TRAVAIL, ARRET et ECO STOP. Le plugin
+ne deduit jamais un etat de la seule commande envoyee.
 
-Node.js 22 (>= 22.13 pour les outils de developpement) ou 24, npm et Homebridge
-sont necessaires. Le plugin compile cible Node 22 >= 22.10 ou 24.
+- ECO STOP conserve l'activation : le poele peut reprendre. En chauffe
+  indique uniquement TRAVAIL, pas la presence de flamme ou de chaleur residuelle.
+- Le contact Eco Stop est **ouvert** uniquement en ECO STOP, **ferme**
+  dans une autre phase reconnue. Ferme ne signifie pas poele eteint.
+  Inconnu ou lecture en echec : indisponible, pas faussement ferme.
+- Maison utilise ses propres libelles, regroupements et curseurs. Le
+  curseur de consigne peut etre grise poele eteint ; ne pas allumer
+  le poele uniquement pour le debloquer.
+- La fraicheur des mesures cloud est inconnue : la reception d'une
+  reponse n'est pas l'heure de mesure. Pas de mise a jour instantanee garantie.
 
-```sh
-npm ci
-npm run check
-```
+| Commande | Phases actuellement autorisees |
+| --- | --- |
+| ON | OFF |
+| OFF | TRAVAIL / ECO STOP |
+| Consigne | OFF / TRAVAIL, consigne initiale numerique |
+| Ventilation | OFF / TRAVAIL, Auto et Powerful OFF, niveau initial 1-7 |
+| Auto | OFF / TRAVAIL / ECO STOP, Powerful OFF |
+| Powerful | OFF / TRAVAIL / ECO STOP, Auto OFF |
+| Programme | OFF / ECO STOP, sans condition Auto/Powerful |
 
-Les tests utilisent le code compile : lancer `npm run build` avant `npm test`
-apres une modification TypeScript. `npm run check` le fait automatiquement.
+Les autres phases et interactions restent refusees par precaution, pas
+selon une interdiction constructeur demontree. En ECO STOP, Nobis-Fi
+autorise Auto, Powerful et Programme d'apres le retour utilisateur ;
+les ecritures du plugin dans cette phase restent a confirmer.
+La ventilation OFF/0 est lisible si son encodage est reconnu, mais pas
+modifiable ; PS n'est pas converti en vitesse. MAN/41 n'est pas une
+temperature : la consigne numerique devient indisponible, sans interdire
+a lui seul un ON/OFF autrement valide.
 
-Pour essayer la version en lecture seule dans une instance Homebridge de developpement :
+## Installation
 
-```sh
-npm run build
-npm link
-```
+Prerequis :
 
-Puis configurer la plateforme Nobis dans les reglages du plugin de l'interface
-Homebridge et redemarrer cette instance. Aucune modification manuelle de la
-configuration n'est necessaire. La communication cloud est desactivee par
-defaut ; elle exige une activation explicite dans la GUI.
+- Homebridge `^1.8.0` ou `^2.0.0` ; tests sur 1.11.4 et 2.4.0.
+- Node.js `^22.10.0` ou `^24.0.0`, selon la version Homebridge installee.
+- Compte Nobis-Fi et poele accessible dans l'application officielle.
+- Acces Internet au cloud Nobis-Fi / Agua-IoT.
 
-Le package est prepare pour une publication publique experimentale
-`0.1.0-beta.0`, sous le tag npm `beta`, pas `latest`. Cela ne constitue
-ni une publication effective ni une validation de production.
-
-## Publication beta et installation sur NAS
-
-Avant publication, verifier le contenu avec `npm pack --dry-run`, les tests
-avec `npm run check`, et renseigner les liens reels du depot public et des
-issues dans les metadonnees du paquet. Aucun lien de depot n'est invente.
-La publication exige les droits sur le nom npm ; un resultat 404 ne les
-garantit pas. Les versions publiees ne peuvent pas etre reutilisees.
-
-Sur le Mac de developpement, s'authentifier localement via le navigateur :
+Verifier d'abord la version beta publiee ; la version du depot n'est pas
+une preuve de publication npm :
 
 ```sh
-npm login --auth-type=web --registry=https://registry.npmjs.org/
-npm whoami --registry=https://registry.npmjs.org/
-npm publish --dry-run --tag beta --access public
-npm publish --tag beta --access public
+npm view homebridge-nobis dist-tags --json
 ```
 
-Ne transmettre aucun jeton, mot de passe ou code de validation dans une
-conversation. La derniere commande rend le paquet public : ne la lancer
-qu'apres la revue du contenu et des metadonnees. `prepublishOnly` execute
-compilation, lint et tests ; `prepack` recompile les fichiers distribues.
-Le tag et le registre sont aussi fixes dans `publishConfig`.
-
-**Seulement apres confirmation de la publication**, dans le terminal de
-l'interface Homebridge du NAS :
+Dans l'interface Homebridge, installer la version beta si cette selection
+est disponible. Sinon, utiliser le terminal de cette installation :
 
 ```sh
 npm install --global homebridge-nobis@beta
 ```
 
-Le tag explicite est necessaire pour cette prerelease ; ne pas supposer
-que la recherche ou l'installation standard de la GUI choisira la beta.
-Actualiser la page Plugins puis configurer Nobis via ses reglages GUI,
-activer les deux options cloud/capteur et redemarrer Homebridge.
-Si le pont est deja associe a Apple Maison, ne pas l'associer une seconde fois.
-Le capteur apparait apres une lecture valide. L'affichage reel dans Maison
-reste a valider ; aucune commande de poele n'est disponible.
+Puis ouvrir **Plugins > Nobis > Reglages**, remplir la configuration,
+enregistrer et redemarrer Homebridge. Aucun fichier de configuration a
+modifier manuellement. Conserver le pont deja associe a Maison ; ne pas
+le supprimer ou le reappairer pour une mise a jour.
 
-## Configuration
+## Configuration graphique
 
-L'interface prevoit l'e-mail et le mot de passe Nobis-Fi, le nom d'affichage du
-poele, un identifiant optionnel, l'intervalle et un diagnostic sans secrets.
-**Les tests automatises n'utilisent jamais de vrais identifiants.**
-La case "Enable read-only cloud discovery" (`enableCloud`, false par defaut)
-active uniquement inscription d'application, authentification, liste des
-appareils et lecture de la carte. Elle ne declenche pas de lecture de buffer,
-de commande de poele, d'appairage ou de modification de sa configuration.
-Seule, cette case ne declenche pas de mesure periodique de temperature.
+Toutes les options de communication et de controle sont **desactivees
+par defaut**. Sans configuration valide, aucune communication cloud ne demarre.
 
-Pour le capteur experimental, activer aussi **Expose experimental read-only
-temperature sensor** (`enableTemperatureSensor`, false par defaut), puis
-redemarrer Homebridge. Le validateur refuse cette option si `enableCloud`
-est desactive. Aucun changement manuel de configuration n'est necessaire.
-Une lecture valide du profil observe est requise avant la creation du
-capteur. La carte est reverifiee et le buffer 1 lu a chaque cycle acheve,
-avec l'intervalle configure, sans requetes de lecture lors d'un GET HomeKit.
+1. Saisir l'e-mail et le mot de passe Nobis-Fi **uniquement dans la GUI locale**.
+2. Activer **Enable read-only cloud discovery**, puis
+   **Expose experimental read-only temperature sensor**.
+3. Donner un nom au poele. Si plusieurs appareils sont lies au compte,
+   selectionner son identifiant localement ; le plugin ne choisit pas au hasard.
+4. Choisir l'intervalle : entier de **30 a 3600 secondes**, **60** par defaut.
+   Ce sont des bornes du plugin, pas un quota Agua-IoT documente.
+5. Activer uniquement les fonctions souhaitees, enregistrer et redemarrer.
 
-Le service **TemperatureSensor** est retenu plutot que HeaterCooler ou
-Thermostat : seule la temperature ambiante est suffisamment etayee.
-Le capteur n'expose ni Active, ni etat de chauffage, ni consigne modifiable.
-Son UUID derive des identifiants produit/appareil, pas du nom ni de la
-temperature. Le cache est reutilise sans doublons ; un ancien appareil
-est retire apres selection et lecture valides du nouveau. Desactiver
-l'option retire les capteurs caches au prochain demarrage.
+| Option | Prerequis |
+| --- | --- |
+| Lecture de temperature | Cloud |
+| Marche/arret | Cloud et temperature |
+| Chauffage / consigne | Marche/arret et ses prerequis |
+| Ventilation | Chauffage et ses prerequis |
+| Auto, Powerful, Programme | Marche/arret et ses prerequis ; Chauffage non requis |
+| En chauffe | Chauffage ; remplace la fonction du switch Marche existant |
+| Eco Stop | Cloud et temperature ; aucune commande requise |
 
-Au demarrage, en cas d'erreur ou a l'arret, le capteur est en defaut :
-`StatusFault` signale le probleme et le GET de temperature renvoie
-`SERVICE_COMMUNICATION_FAILURE`, sans zero fictif ni succes avec une
-ancienne valeur. Une lecture valide retablit le service. Une valeur hors
-des bornes HAP est refusee, jamais tronquee. Le backoff et l'arret sur
-erreur de protocole restent applicables.
+**Programme :** les jours et horaires se configurent dans Nobis-Fi.
+Maison active ou desactive cette programmation. Verifier les horaires
+existants avant activation : ils peuvent permettre des allumages/arrets.
 
-**Limite importante :** une reponse cloud reussie ne prouve pas que la
-telecommande mesure actuellement. Apple Maison ne peut pas afficher notre
-avertissement de fraicheur inconnue dans la valeur de temperature.
-Ne pas utiliser ce capteur experimental pour une automatisation critique.
-L'affichage dans Apple Maison et la compatibilite complete restent a
-valider dans une instance Homebridge de developpement.
+**En chauffe :** revoir les automatisations de l'ancien switch avant de
+changer son usage. Il devient un indicateur : ses clics sont refuses.
+Desactiver l'option restaure sa commande Marche. Maison peut conserver
+un nom personnalise ; le renommer si necessaire.
 
-Pour une validation manuelle locale : saisir les identifiants uniquement dans
-la GUI, activer cette case, puis redemarrer l'instance de developpement.
-Desactiver la case et redemarrer pour arreter cette validation.
-Ne pas effectuer cette procedure dans les tests ou en CI.
+**Eco Stop :** activer **Enable read-only Eco Stop contact sensor**.
+Il ajoute un seul ContactSensor au meme poele, sans switch supplementaire
+ni nouvelle requete cloud. Desactiver l'option retire seulement ce service.
+Son fonctionnement dans Maison a ete confirme le 3 novembre 2026.
 
-Il faut exactement un appareil non supprime, ou un `deviceId` explicite. Les
-erreurs de schema, identifiants refuses et selections ambigues arretent la
-decouverte jusqu'a correction/redemarrage, sans choisir un poele au hasard.
-Un appareil hors ligne declenche une temporisation, pas un etat OFF.
+## Commandes et confirmation
 
-Le nom du poele sert au nom du capteur optionnel, pas a son identite. Le diagnostic
-utilise le niveau debug Homebridge pour les durees/statuts, jamais les reponses
-brutes. Les definitions ne sont pas imprimees dans les journaux.
+Maison recoit une reponse des la **prise en charge locale**, sans attendre
+le cloud. Cette reponse ne garantit ni acceptation par Agua-IoT ni execution
+par le poele. La tuile conserve le dernier etat observe et peut revenir
+temporairement a cette valeur ; seule une lecture API confirme le changement.
 
-Configuration incomplete/invalide : avertissement sans valeurs sensibles et
-aucune tache de demarrage. Le mot de passe est conserve exactement, espaces
-compris. Le champ masque de la GUI ne chiffre pas les fichiers de configuration
-Homebridge : proteger leur stockage et leurs sauvegardes.
+Une seule commande peut etre traitee a la fois, sans file d'attente.
+Un marqueur prive est synchronise avant le POST. Une cible en attente
+bloque les autres ecritures, mais pas les lectures valides. Les marqueurs
+survivent au redemarrage, meme si l'option de controle est desactivee.
+Pas de retry d'ecriture, commande inverse ou restauration automatique.
 
-L'intervalle se saisit dans un champ numerique : entier de 30 a 3600 secondes,
-60 par defaut. Il est obligatoire dans la GUI afin qu'une valeur invalide ne
-soit pas simplement omise lors de la sauvegarde. Le validateur runtime conserve
-le defaut de 60 secondes pour une ancienne configuration sans ce champ.
+Les relectures recherchent la cible, avec au plus trois rafraichissements
+rapides espaces de cinq secondes, puis le polling normal. Un job cloud
+termine n'est pas une confirmation physique ; ON est confirme par
+TRAVAIL ou ECO STOP, OFF uniquement par OFF.
 
-Ne jamais partager mot de passe, jetons, cookies ou captures privees dans une
-conversation, une issue ou un depot. Aucune telemetrie n'est ajoutee.
+Les logs distinguent `accepted locally`, `processing finished` et
+`processing failed`. Un echec apres la reponse locale **ne peut plus etre
+renvoye au clic initial**. Consulter les logs et Nobis-Fi avant de reessayer.
 
-## Client independant de HomeKit
+## Depannage
 
-Le client exporte `getDevices()`, `getRegisterMap(device)`, `readBuffer(device,
-bufferId?)` et `close()`. Il recoit une identite d'application UUID v4 et les
-identifiants localement ; `loadAppIdentity(storagePath)` peut fournir cet UUID
-dans le stockage Homebridge. Il ne contient aucune methode de commande. `inspectBufferConfiguration(device)`
-demande seulement la configuration existante et renvoie un resultat de job
-non interprete, reserve au diagnostic experimental.
+### « Sans reponse »
 
-`readBuffer` omet `BufferId` si non fourni (defaut 0 selon le Swagger), sans
-supposer que le buffer communautaire 1 convient a l'A8. Cette methode reste
-utilisee par la plateforme uniquement lorsque le capteur experimental est
-explicitement active, avec le buffer 1. Elle renvoie des entiers bruts par adresse
-et l'heure de reception locale, pas une temperature, un etat thermique ou une
-preuve de fraicheur de la mesure.
+Consulter les lignes `[Nobis]` du journal Homebridge :
 
-Le client accepte `refreshToken` ou `refresh_token` seulement s'ils sont valides
-et non contradictoires. Il accepte le format communautaire `jobAnswerData`
-avec tableaux `Items`/`Values` valides. Un `jobAnswerPayload` supplementaire
-reste opaque et n'est ni interprete ni utilise comme source de valeurs.
-Une reponse contenant uniquement ce payload reste refusee.
-Les etats de job inconnus sont des erreurs,
-pas une reussite fictive.
+- `deviceJobStatus ... terminated` : job indisponible. Le plugin marque
+  les lectures en defaut puis reessaie avec temporisation progressive.
+- `homekit-temperature-range` : mesure refusee, sans clamp ni substitution.
+  Depuis beta.26, le polling reprend et une mesure valide restaure les services.
+- `Automatic discovery stopped` : configuration, permissions, profil ou
+  reponse API incompatible. Corriger la cause avant de redemarrer ; ne pas
+  effacer les verrous pour contourner le probleme.
+- `pendingPowerAction`, `pendingSetpoint`, `pendingVentilation`, `pendingAuto`,
+  `pendingPowerful`, `pendingChrono` : resultat de commande encore incertain.
+  Verifier Nobis-Fi et attendre la relecture.
+- `write refused before cloud request` : phase, mode ou disponibilite non
+  autorise ; aucune commande n'a ete envoyee.
 
-Les formules, encodages et limites sont conserves comme metadonnees validees,
-sans evaluation, troncature ou conversion HomeKit. Les commandes et la lecture
-explicite `deviceRequestReading` ne sont pas implementees : le protocole et la
-semantique de `Freq: 0` du modele cible restent a valider.
+Verifier aussi que Nobis-Fi communique avec le poele et que Homebridge est
+accessible. Un poele hors ligne n'est jamais declare OFF. Une panne cloud
+ne peut pas etre contournee par ce plugin : pas de solution locale integree.
 
-`decodeNobisAmbientTemperature(map, reading, bufferId)` est un decodeur
-independant, sans reseau. Il exige le buffer 1 et le profil observe de
-`temp_air2_get` (GET, adresse 103, masque 65535, formule `#`, mot little-endian
-non signe). Il utilise l'entier fourni par l'API, sans assembler des adresses
-voisines ni executer de formule. Une valeur absente, un profil different ou un
-entier hors du domaine du mot provoque une erreur explicite, pas un repli.
-Le resultat contient `celsius`, `receivedAt` et `freshness: 'unknown'` :
-l'heure de reception n'est jamais une heure de mesure. Le domaine du mot
-n'est pas une plage de temperatures physiques ou HomeKit.
-La concordance avec la telecommande a ete observee sur l'appareil cible,
-pas certifiee pour tous les modeles Nobis. Le decodeur est utilise uniquement
-par le mode temperature du diagnostic navigateur et le capteur HomeKit
-optionnel. Le diagnostic brut et le CLI restent sans conversion ; aucune
-lecture de temperature n'est activee par defaut.
+### Abandon explicite des cibles en attente
 
-Chaque requete est bornee a 10 secondes, lecture du corps comprise, et 2 Mo.
-Le suivi du buffer a un budget global de 30 secondes et une attente de
-1 seconde avant la premiere consultation du job puis entre consultations.
-L'attente initiale suit une pratique du client communautaire Go ; ce n'est
-pas une exigence fournisseur ni une resolution prouvee des reponses manquantes.
-Le budget global inclut cette attente et les statuts indisponibles restent
-des erreurs terminales. Les appels identiques sont mutualises ; un
-401 provoque au maximum un renouvellement et une repetition de la lecture.
-Un refus de renouvellement HTTP 401/403/422 permet une seule nouvelle connexion ;
-une panne reseau/serveur ne provoque pas de boucle de login.
+Utiliser cette recuperation seulement pour conserver les reglages actuels
+et abandonner toutes les anciennes cibles, pas comme commande d'arret :
 
-La decouverte s'execute apres chaque cycle acheve, au minimum toutes les
-30 secondes (60 par defaut). Le backoff progressif est plafonne a 15 minutes
-sans raccourcir un intervalle utilisateur plus long, et `Retry-After` est
-respecte. Ce sont des politiques du plugin, pas des quotas cloud documentes.
-L'arret annule les requetes et timers, sans appel de logout cloud.
+1. Arreter le poele dans Nobis-Fi ou avec sa telecommande.
+2. Dans la GUI, cocher **Confirm one-time abandonment of ALL pending commands**,
+   enregistrer et redemarrer le pont. Cloud, temperature et Marche doivent
+   rester actives pour le poele selectionne.
+3. Attendre `Pending-command abandonment complete`. Le plugin exige une
+   lecture valide OFF, temperature, consigne et reglages ; un verrou Chrono
+   exige aussi une lecture Chrono valide. Le stockage corrompu n'est pas contourne.
+4. Decocher la confirmation, enregistrer et redemarrer pour rearmer une
+   future confirmation explicite.
 
-Seul l'UUID d'application est persiste : sous-dossier `homebridge-nobis` du
-stockage Homebridge en 0700, fichier `app-id` en 0600. Les jetons restent en
-memoire. Une identite corrompue ou un lien symbolique est refuse explicitement,
-pas remplace silencieusement.
+La confirmation est consommee durablement une seule fois, meme sans cible.
+La laisser cochee ne supprime pas les futurs verrous. Les six types de
+cibles sont concernes, y compris les controles desactives. Un echec partiel
+ne provoque pas de nouvelle suppression automatique.
+**Aucun ordre n'est envoye et aucune commande deja distante n'est annulee** :
+elle peut encore s'executer. Ne pas supprimer manuellement le stockage.
 
-## Diagnostic local sans Homebridge
+### Diagnostic et confidentialite
 
-### Interface simple dans le navigateur
+L'option diagnostic ajoute des durees, statuts et codes utiles, sans
+mot de passe, jeton, cookie, identifiant d'appareil ou reponse brute.
+Les etats receptionnes ne prouvent pas la fraicheur de la mesure.
 
-Depuis le projet compile, lancer :
+Pour une investigation locale depuis les sources :
 
 ```sh
 npm run build
 npm run diagnostic:browser
 ```
 
-Ouvrir l'adresse `http://127.0.0.1:...` affichee dans le terminal. Le port est
-choisi automatiquement ; le serveur ecoute uniquement sur la boucle locale.
-Saisir les identifiants dans le formulaire et cliquer sur le bouton de test.
-Le lancement de l'interface ne contacte pas Agua-IoT. Le clic autorise une
-seule decouverte des appareils et definitions, sans commande ni buffer.
-Une selection ambigue ou un poele hors ligne provoque un echec explicite.
+L'adresse locale affichee ouvre un formulaire. Aucune connexion avant
+une action explicite. Choisir les lectures pour diagnostiquer ; les
+essais d'ecriture demandent une confirmation et commandent un vrai poele.
+Arreter avec Ctrl+C.
 
-Le selecteur propose aussi « Structure de la configuration des buffers ».
-Ce mode appelle l'endpoint documente `deviceGetConfigBuffer`, puis suit son
-job pendant au maximum 30 secondes (budget global de session : deux minutes).
-Il ne modifie pas les buffers et ne lit pas leurs valeurs. Le navigateur
-affiche les noms/types des champs, sans leurs valeurs scalaires, sauf le
-seul code numerique `jobAnswerData.NackErrCode` s'il est un entier sur ;
-les champs sensibles connus sont exclus. La structure est bornee et signale
-ses troncatures. Une chaine JSON reste opaque, sans decodage suppose.
-Un code absent ou malforme est indique explicitement, sans conversion de
-chaine ni valeur par defaut. La signification de ce code reste inconnue :
-meme 0 n'est pas assimile a une reussite. Un job termine est affiche comme
-**configuration non validee**, pas comme
-un buffer identifie.
-Le selecteur propose aussi l'inspection de l'identifiant de buffer configure,
-via l'endpoint exact `devicegetBufferId`. Son resultat final n'est pas
-documente : le diagnostic expose uniquement sa structure et NackErrCode,
-avec observation ciblee de `jobAnswerData.BufferCnt` et `Indexes` si leur
-format est coherent : entiers surs non negatifs, indices distincts, au maximum
-256 elements et nombre egal a la longueur du tableau. Sinon les valeurs sont
-masquees et le format indique invalide ; aucun champ absent n'est invente.
-Ces regles sont des garde-fous de diagnostic, pas un contrat fournisseur.
-Les indices observes ne sont pas automatiquement identifies au buffer adapte
-aux mesures du modele. Aucun enchainement automatique
-vers une lecture de mesures n'est effectue. Les memes budgets, protections
-et erreurs de job s'appliquent aux deux modes experimentaux.
-Ces modes ne recuperent pas la carte des registres et ne choisissent pas un buffer.
-Le mode « Lecture brute unique du buffer 1 » est distinct et experimental,
-prepare apres observation locale de l'indice 1 dans la liste des buffers.
-Un clic demande seulement `deviceGetBufferReading` avec `BufferId: 1`,
-puis suit son job. Il ne consulte ni ne scanne les indices 130/131/132 et
-ne modifie aucun buffer. Les autres modes ne declenchent pas cette lecture.
-Le resultat affiche les couples adresse/entier brut valides et l'heure de
-reception locale, sans preuve de fraicheur ni conversion thermique.
-Le format `jobAnswerData.Items/Values` est le seul pris en charge ; la
-presence d'un `jobAnswerPayload` supplementaire ne bloque pas les tableaux
-valides de jobAnswerData, mais son contenu n'est jamais interprete.
-Un format inconnu, un job manquant ou une erreur arrete l'essai, sans repli
-sur un autre indice. Les valeurs restent en memoire dans la page et sont
-effacees au rechargement, a une nouvelle tentative ou par le bouton dedie.
-Elles ne sont ni enregistrees ni certifiees anonymes.
+Ne jamais publier de credentials, captures privees ou reponses brutes dans
+une issue. Le champ masque ne chiffre pas la configuration Homebridge :
+proteger son stockage et ses sauvegardes. Identite d'application et marqueurs
+sont conserves dans le stockage prive Homebridge ; aucune telemetrie,
+TLS non desactive et aucune transmission non necessaire ajoutee.
 
-Le mode distinct **Temperature ambiante du profil valide (experimental)**
-recupere la carte puis demande une seule lecture du buffer 1. Il verifie
-le profil observe de `temp_air2_get` et affiche seulement sa temperature
-en degres Celsius et l'heure de reception, sans transmettre les autres
-valeurs, la carte ou les identifiants a la page. Une carte differente ou
-une mesure absente/invalide produit une erreur explicite, sans repli.
-La fraicheur reste **inconnue**, notamment lorsque la telecommande est
-deconnectee : une reponse cloud reussie n'atteste pas une mesure actuelle.
-Le resultat est efface par le bouton dedie, une nouvelle tentative ou un
-rechargement. Ce mode ne lance ni lecture periodique ni commande ni
-exposition HomeKit. Les modes brut et definitions conservent leur comportement.
+## Developpement et publication
 
-Une lecture terminee mais refusee par le parseur expose un diagnostic limite
-aux types des enveloppes et des tableaux Items/Values et a leurs longueurs.
-L'erreur distingue enveloppe non prise en charge et valeurs invalides.
-Aucune reponse brute, chaine serveur ou valeur de mesure n'est extraite de
-ce resultat refuse. Cela ne desactive pas la validation et ne relance pas
-la lecture ; le diagnostic structurel est effacable dans la page.
-Si le job devient indisponible, le diagnostic distingue les statuts connus
-`terminated`, `Missing job` et `Missing job answer`. Aucun de ces statuts
-ne permet de deduire la cause, l'etat du poele ou un code NackErrCode.
-La requete de configuration n'est pas relancee automatiquement.
-Le bouton d'effacement retire la structure de la page ; aucun rapport
-n'est ecrit. Les noms de champs ne sont pas certifies anonymes.
-
-L'e-mail et le mot de passe ne sont ni journalises ni enregistres par l'outil.
-Le champ mot de passe est vide apres lancement ; le navigateur peut toutefois
-proposer son propre gestionnaire de mots de passe. Seul l'UUID d'application
-est conserve dans `~/.homebridge-nobis-diagnostic/browser-storage/homebridge-nobis/app-id`
-avec permissions privees. Cette interface affiche les compteurs et les
-definitions validees des registres, sans identifiants d'appareil ni de carte.
-Un tableau filtrable montre `reg_key`, `reg_type`, `offset`, `mask`, `formula`
-et tous les autres champs disponibles dans le detail de chaque ligne :
-bornes, encodages, flags et enumerations sont conserves exactement.
-Les formules sont du texte, jamais du code execute ; les definitions ne sont
-pas des mesures actuelles et ne suffisent pas a choisir un buffer.
-Le filtre fonctionne localement sans requete cloud supplementaire.
-Les definitions restent en memoire dans la page, sans rapport enregistre :
-le bouton d'effacement, une nouvelle tentative ou un rechargement les retire.
-Ces chaines issues du serveur ne sont pas certifiees anonymes : ne pas les
-partager sans revue locale. Elle n'atteste pas la
-compatibilite thermique. Un test a un budget de deux minutes et les tests
-concurrents sont refuses. Ctrl+C arrete le serveur et annule le client.
-
-L'interface refuse les origines et noms d'hote externes et exige un jeton
-local pour le test. Elle n'est pas destinee a etre exposee sur le reseau,
-via un proxy ou sur Internet. Ne pas partager les identifiants ou captures.
-
-### Diagnostic en ligne de commande
-
-L'outil est prepare pour macOS/Linux. Les tests utilisent des reponses fictives.
-Le mode par defaut affiche seulement l'aide, sans lire
-de fichier, creer de stockage ou contacter Agua-IoT :
+Dynamic Platform TypeScript derivee du [template officiel Homebridge](https://github.com/homebridge/homebridge-plugin-template/tree/ab217b1ff36fbbf69931822324e1986113cd9d81).
+Client Agua-IoT, modeles et validations sont separes des accessoires HomeKit.
+Node 22 >= 22.13 ou Node 24 pour les outils de developpement.
 
 ```sh
-npm run build
-npm run diagnostic
+npm ci
+npm run check
+npm run check:package
 ```
 
-Le diagnostic est distinct de la procedure normale du plugin via GUI. Il
-n'exige ni instance Homebridge ni modification de sa configuration.
-Il n'envoie jamais de commande de controle et ne fonctionne pas en boucle.
+Les tests importent le code compile : recompiler avant `npm test`.
+Ils utilisent des mocks et le vrai HAP, jamais un poele reel.
+La CI verifie Node 22/24 avec Homebridge 1.11.4/2.4.0, compilation,
+lint, tests et contenu npm, y compris le chargement d'une archive isolee.
+Preparation du 3 novembre 2026 : **337 tests reussis dans chacune des
+quatre combinaisons**, compilation/lint verifies avec les deux Homebridge.
+Ces checks locaux ne prouvent pas l'execution de la CI sur GitHub, la
+publication npm ou la certification. Les essais GUI/bridge appaire sous
+Homebridge 2 et la stabilite prolongee sur appareil restent a confirmer.
 
-### Procedure future, a executer uniquement apres decision de validation locale
-
-1. Creer un dossier prive dedie hors du projet (permissions 0700).
-2. Avec un editeur local, y creer `credentials.json`, permissions 0600,
-   contenant uniquement les champs JSON `email` et `password` du compte
-   Nobis-Fi. Ne jamais saisir le mot de passe dans une commande shell,
-   transmettre ce fichier ici, le publier ou le committer.
-3. Fournir des chemins absolus a l'outil et autoriser explicitement la connexion :
+Avant publication, verifier les versions deja publiees et les tags npm,
+la coherence package/lockfile, les notes de release, le contenu du paquet
+et les tests sur les quatre combinaisons. Les versions npm ne sont pas reutilisables.
+Authentification npm uniquement localement, sans communiquer de jeton :
 
 ```sh
-npm run diagnostic -- --connect \
-  --credentials /chemin/prive/credentials.json \
-  --storage /chemin/prive/diagnostic-storage
+npm login --auth-type=web --registry=https://registry.npmjs.org/
+npm publish --dry-run --tag beta --access public
+# Publication publique, uniquement apres validation et accord du mainteneur :
+npm publish --tag beta --access public
 ```
 
-Ces chemins sont des exemples a remplacer, pas des fichiers fournis.
-Le fichier d'identifiants doit appartenir a l'utilisateur courant et ne pas
-etre un lien symbolique. Le stockage dedie doit etre prive : l'outil refuse
-un dossier existant public au lieu de modifier ses permissions.
-Le fichier d'identifiants reste local : l'outil ne le supprime pas. Le supprimer
-manuellement apres les essais s'il n'est plus necessaire.
+`prepublishOnly` execute les checks ; `prepack` compile. La preparation
+locale et un dry-run ne publient rien. Aucun statut stable ni Verified
+n'est revendique. Avant une demande Verified, reexaminer les criteres
+officiels en vigueur, les versions Node/Homebridge prises en charge,
+les metadonnees et les validations sur installation reelle.
 
-Sans `--buffer`, cette commande ne lit que les appareils et la carte.
-`--device-id` permet une selection locale en presence de plusieurs poeles ;
-sans selection univoque, l'outil s'arrete avant de lire une carte.
+## Documentation et support
 
-**Ne pas ajouter `--buffer` avant d'avoir determine le buffer pertinent pour
-le modele.** L'option `--buffer ID` demandera une seule lecture brute du buffer
-explicitement choisi. Aucun choix automatique du buffer 1, aucune modification
-de sa configuration, aucune conversion ni interpretation d'un etat thermique.
+- [Etude API, sources, licences, preuves et inconnues](docs/ETUDE-API.md)
+- [Historique des betas](CHANGELOG.md)
+- [Archive de developpement](docs/HISTORIQUE-DEVELOPPEMENT.md) :
+  anciennes procedures et restrictions, pas le guide actuel.
+- [Depot et issues](https://github.com/slebrin/homebridge-nobis)
 
-Le resultat est ecrit dans `diagnostic-storage/reports/diagnostic-<UUID>.json`,
-avec repertoire 0700 et fichier 0600. Chaque essai reussi cree un nouveau
-rapport, sans ecraser un precedent. La console n'imprime que des compteurs.
-Le rapport conserve les definitions de registres et, si demandees, les
-valeurs brutes, mais pas l'e-mail, le mot de passe, les jetons, l'UUID
-d'application, les noms/identifiants d'appareil, l'identifiant de carte ou les
-reponses HTTP brutes. Les chaines issues des registres restent des donnees du
-serveur : **ce rapport n'est pas certifie anonyme et ne doit pas etre publie ou
-partage sans inspection locale prealable.**
-
-L'outil conserve les blocages du client : un payload seul sans Items/Values valides,
-un etat inconnu ou une carte incompatible provoque un echec explicite, pas
-un rapport de succes. Une lecture du buffer ne prouve pas sa fraicheur.
-Ctrl-C/SIGTERM ferment le client et annulent les requetes ; les operations
-reseau du diagnostic ont un budget global de deux minutes, en plus des
-timeouts du client. Aucun logout cloud automatique.
-
-## Limites et prochaines etapes
-
-- Aucun controle de poele ; polling thermique et capteur HomeKit experimentaux
-  uniquement sur activation explicite.
-- Aucun etat ou capteur HomeKit invente.
-- Les formats de session et de jobs du Swagger et des clients tiers divergent.
-- Les registres, phases, limites et commandes de l'A8 V Round restent a valider
-  localement pendant la phase de lecture seule.
-- Aucun fallback local : l'integration prevue depend du service cloud.
-- Le nom npm est provisoire ; disponibilite et absence de conflit a revalider.
-
-CI configuree pour compiler, linter et tester sur Node 22/24. Node 26 est a
-ajouter lorsqu'il devient LTS et pris en charge par Homebridge. La compatibilite
-Homebridge 2 devra etre verifiee avant publication, et pas seulement declaree
-dans les metadonnees.
-
-La validation du client et de la plateforme utilise exclusivement des mocks,
-dont des tests d'expiration, erreurs, timeout du corps, budget de job,
-reconnexion, Retry-After, concurrence, arret et persistance privee. Un test
-d'enregistrement utilise l'API reelle de Homebridge 1.11.4, sans reseau.
-Compilation, lint et tests reussis sous Node 22 et 24, diagnostic autonome
-compris. L'aide `npm run diagnostic` a ete executee en mode hors ligne uniquement.
-Le contenu npm a ete examine avec `npm pack --dry-run --ignore-scripts`,
-sans publication.
-
-Le formulaire a aussi ete verifie dans Homebridge Config UI X 5.29.0, avec
-Homebridge 1.11.4 installe, sous Node 24 sur macOS. Cette UI temporaire a tourne
-seule sur localhost, sans demarrer le bridge, avec des identifiants fictifs et
-le cloud desactive. Les identifiants manquants, e-mail invalide et mot de passe
-compose d'espaces bloquent la sauvegarde. Le champ mot de passe est masque ;
-ses espaces significatifs sont conserves dans la configuration sauvegardee.
-Les intervalles 29, 3601, 30.5 et vide bloquent la sauvegarde ; 30, 3600 et 60
-sont sauvegardes exactement puis retrouves a la reouverture. Le nom optionnel
-et le diagnostic sont conserves, et un identifiant de poele vide est omis.
-La configuration produite a ete validee par le runtime et aucun appel Agua-IoT
-n'a ete declenche avec le cloud desactive.
-
-Ces essais navigateur sont une verification locale, pas une suite GUI en CI
-ni une validation Homebridge 2 ou materielle.
-
-L'interface navigateur autonome a ete verifiee localement : affichage,
-refus d'un mot de passe compose d'espaces, affichage du resultat avec une
-reponse simulee et effacement du champ mot de passe. Aucun compte reel n'a
-ete utilise. Ses tests automatises simulent le cloud et couvrent aussi le
-refus des acces externes, les corps invalides, les erreurs sans secrets,
-la concurrence, le timeout et la fermeture.
-
-Avant HomeKit, il faut confirmer localement le format du login, l'identite du
-produit, sa carte, le buffer adapte, la forme du resultat de job et la fraicheur
-des mesures. Il faut ensuite valider les codes d'etat, unites et formules.
-Un succes de decouverte des definitions n'est pas une preuve de compatibilite
-thermique ou de controle. En cas de format inconnu, arreter ce point et examiner
-le contrat localement, sans essayer des commandes alternatives.
-
-Avant publication : definir auteur, depot GitHub public, homepage et URL
-d'issues avec le mainteneur ; activer les issues ; publier des releases et
-notes ; verifier les criteres Verified alors applicables. Les mots-cles
-`homebridge-plugin` et `supports-hap` sont declares, pas `supports-matter`.
-
-## Licence
-
-Apache-2.0. Voir [LICENSE](LICENSE) et [NOTICE](NOTICE).
-L'etude cite aussi un ancien plugin AGPL ; son code n'est pas reutilise.
+Licence Apache-2.0 : [LICENSE](LICENSE), [NOTICE](NOTICE).
+Les projets communautaires cites dans l'etude ont servi de sources
+d'analyse ; leurs fonctions generiques ne prouvent pas le support Nobis.

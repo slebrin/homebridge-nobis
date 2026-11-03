@@ -8,6 +8,15 @@ import { AguaError, AguaJobUnavailableError, AguaReadingProtocolError } from './
 import type { ReadingStructure } from './agua/errors.js';
 import { loadAppIdentity } from './agua/identity.js';
 import { decodeNobisAmbientTemperature } from './agua/temperature.js';
+import { record } from './agua/models.js';
+import { confirmSetpoint } from './agua/setpoint-confirmation.js';
+import { decodeSetpoint } from './agua/command-preview.js';
+import { observeNobisStatus } from './agua/status-observation.js';
+import { observeOperatingSettings } from './agua/operating-settings.js';
+import { previewFrontVentilation } from './agua/ventilation-preview.js';
+import { previewPowerLevel } from './agua/power-level-preview.js';
+import { previewAuto, previewPowerful } from './agua/auto-preview.js';
+import { confirmReading } from './agua/readback-confirmation.js';
 import { ConfigError, parseConfig } from './config.js';
 import { discoverDevice, discoverRegisterMap } from './diagnostic.js';
 import { describeResponseShape, observeBufferIndexes, observeNackCode } from './diagnostic-shape.js';
@@ -67,6 +76,26 @@ function safeFailure(error: unknown): { status: number; error: string; readingSt
   if (error instanceof AguaError) {
     const guidance = error.operation === 'diagnostic-device-selection'
       ? ' Selection impossible : verifiez le compte ou renseignez un identifiant pour plusieurs poeles.'
+      : error.operation === 'power-initial-phase'
+        ? ' Commande non envoyee : allumage exige OFF, arret exige TRAVAIL ou ECO STOP ; phase relue differente ou non validee.'
+      : error.operation === 'power-preview'
+        ? ' Commande non envoyee : profil ou enumerations marche/arret incompatibles.'
+      : error.operation === 'ventilation-initial-state'
+        ? ' Commande non envoyee : essai limite a OFF/TRAVAIL, ventilation initiale 1..7, Auto et Powerful bruts a 0.'
+      : error.operation === 'power-level-initial-state'
+        ? ' Commande non envoyee : essai limite a OFF/TRAVAIL, Auto et Powerful bruts a 0.'
+      : error.operation === 'auto-initial-state'
+        ? ' Commande non envoyee : essai Auto limite a OFF/TRAVAIL/ECO STOP et Powerful OFF.'
+      : error.operation === 'auto-preview' || error.operation === 'auto-unchanged'
+        ? ' Commande non envoyee : profil Auto incompatible ou cible identique.'
+      : error.operation === 'powerful-initial-state'
+        ? ' Commande non envoyee : essai Powerful limite a OFF/TRAVAIL/ECO STOP et Auto OFF.'
+      : error.operation === 'powerful-preview' || error.operation === 'powerful-unchanged'
+        ? ' Commande non envoyee : profil Powerful incompatible ou cible identique ; CRONO exclu.'
+      : error.operation === 'power-level-preview' || error.operation === 'power-level-unchanged'
+        ? ' Commande non envoyee : profil puissance incompatible, niveau invalide, special ou identique.'
+      : error.operation === 'ventilation-preview' || error.operation === 'ventilation-unchanged'
+        ? ' Commande non envoyee : profil incompatible, niveau invalide ou identique ; OFF et PS exclus de cet essai.'
       : error.operation === 'diagnostic-device-offline' ? ' Le poele est signale hors ligne.'
       : error.operation === 'ambient-temperature'
         ? ' Temperature refusee : registre absent, valeur invalide ou profil different du profil valide. Aucun repli ni nouvel essai automatique.'
@@ -131,7 +160,7 @@ export async function startDiagnosticBrowser(
       return;
     }
     if (request.method !== 'POST'
-      || !['/discover', '/buffer-configuration', '/buffer-id', '/buffer-one', '/ambient-temperature'].includes(request.url ?? '')) {
+      || !['/discover', '/buffer-configuration', '/buffer-id', '/buffer-one', '/ambient-temperature', '/settings-read', '/status-read', '/power-test', '/setpoint-read', '/setpoint-test', '/ventilation-test', '/power-level-test', '/auto-test', '/powerful-test'].includes(request.url ?? '')) {
       throw new RequestError(404, 'Route indisponible.');
     }
     if (request.headers.origin !== origin || request.headers['x-nobis-token'] !== token) {
@@ -148,13 +177,152 @@ export async function startDiagnosticBrowser(
     try {
       const input = await readInput(request);
       const config = parseConfig(input);
+      const writeInput = request.url === '/setpoint-test' ? record(input, 'setpoint-test') : undefined;
+      const powerInput = request.url === '/power-test' ? record(input, 'power-test') : undefined;
+      const ventilationInput = request.url === '/ventilation-test' ? record(input, 'ventilation-test') : undefined;
+      const powerLevelInput = request.url === '/power-level-test' ? record(input, 'power-level-test') : undefined;
+      const autoInput = request.url === '/auto-test' ? record(input, 'auto-test') : undefined;
+      const powerfulInput = request.url === '/powerful-test' ? record(input, 'powerful-test') : undefined;
+      if (powerfulInput !== undefined
+        && (powerfulInput.confirmPowerfulChange !== true || typeof powerfulInput.enabled !== 'boolean')) {
+        throw new RequestError(400, 'Choisissez explicitement Powerful ON/OFF et confirmez la modification reelle.');
+      }
+      if (autoInput !== undefined && (autoInput.confirmAutoChange !== true || typeof autoInput.enabled !== 'boolean')) {
+        throw new RequestError(400, 'Choisissez explicitement Auto ON/OFF et confirmez la modification reelle.');
+      }
+      if (powerLevelInput !== undefined
+        && (powerLevelInput.confirmPowerLevelChange !== true || typeof powerLevelInput.level !== 'number'
+          || !Number.isSafeInteger(powerLevelInput.level) || powerLevelInput.level < 1 || powerLevelInput.level > 7)) {
+        throw new RequestError(400, 'Confirmez la puissance reelle et choisissez un niveau entier 1 a 7.');
+      }
+      if (ventilationInput !== undefined
+        && (ventilationInput.confirmVentilationChange !== true || typeof ventilationInput.level !== 'number'
+          || !Number.isSafeInteger(ventilationInput.level) || ventilationInput.level < 1 || ventilationInput.level > 7)) {
+        throw new RequestError(400, 'Confirmez la ventilation reelle et choisissez un niveau entier 1 a 7. OFF et PS exclus.');
+      }
+      if (powerInput !== undefined
+        && (powerInput.confirmPowerChange !== true || (powerInput.action !== 'on' && powerInput.action !== 'off'))) {
+        throw new RequestError(400, 'Confirmez la commande reelle et choisissez on ou off.');
+      }
+      if (writeInput !== undefined
+        && (writeInput.confirmSetpointChange !== true || typeof writeInput.celsius !== 'number'
+          || !Number.isSafeInteger(writeInput.celsius) || writeInput.celsius < 7 || writeInput.celsius > 40)) {
+        throw new RequestError(400, 'Confirmez la modification reelle et choisissez une consigne entiere de 7 a 40.');
+      }
       const appId = await loadAppIdentity(storagePath);
       if (deadline.signal.aborted || stopped) {
         throw new AguaError('closed', 'browser-discovery');
       }
-      client = new AguaClient({ email: config.email, password: config.password, appId }, options.clientOptions);
+      client = new AguaClient({ email: config.email, password: config.password, appId }, {
+        ...options.clientOptions, enableExperimentalSetpoint: writeInput !== undefined,
+        enableExperimentalPower: powerInput !== undefined,
+        enableExperimentalVentilation: ventilationInput !== undefined,
+        enableExperimentalPowerLevel: powerLevelInput !== undefined,
+        enableExperimentalAuto: autoInput !== undefined,
+        enableExperimentalPowerful: powerfulInput !== undefined,
+      });
       let result: object;
-      if (request.url === '/ambient-temperature') {
+      const confirmSettings = async (
+        device: Parameters<AguaClient['readBuffer']>[0],
+        map: Parameters<typeof observeOperatingSettings>[0],
+        key: 'fun_auto_set' | 'fun_pwf_set' | 'power_set' | 'vent_front_set',
+        target: number,
+      ) => {
+        const activeClient = client;
+        if (activeClient === undefined) {
+          throw new AguaError('closed', 'settings-confirmation');
+        }
+        const confirmation = await confirmReading(
+          () => activeClient.readBuffer(device, 1),
+          reading => observeOperatingSettings(map, reading),
+          settings => settings.registers.some(entry => entry.key === key && entry.rawValue === target
+            && (key === 'fun_auto_set' || key === 'fun_pwf_set'
+              ? entry.label === (target === 1 ? 'ON' : 'OFF') : entry.label === null)),
+          deadline.signal,
+        );
+        return { after: confirmation.value, readbackMatches: confirmation.readbackMatches,
+          observations: confirmation.observations };
+      };
+      if (powerfulInput !== undefined && typeof powerfulInput.enabled === 'boolean') {
+        const { device, map } = await discoverRegisterMap(client, config.deviceId);
+        const initialReading = await client.readBuffer(device, 1);
+        const preview = previewPowerful(device, map, initialReading, powerfulInput.enabled);
+        await client.testPowerful(device, map, initialReading, powerfulInput.enabled);
+        result = {
+          originalEnabled: preview.originalEnabled, requestedEnabled: powerfulInput.enabled,
+          before: preview.settings, ...await confirmSettings(device, map, 'fun_pwf_set', Number(powerfulInput.enabled)),
+          physicalEffectVerified: false, freshnessVerified: false,
+        };
+      } else if (autoInput !== undefined && typeof autoInput.enabled === 'boolean') {
+        const { device, map } = await discoverRegisterMap(client, config.deviceId);
+        const initialReading = await client.readBuffer(device, 1);
+        const preview = previewAuto(device, map, initialReading, autoInput.enabled);
+        await client.testAuto(device, map, initialReading, autoInput.enabled);
+        result = {
+          originalEnabled: preview.originalEnabled, requestedEnabled: autoInput.enabled,
+          before: preview.settings, ...await confirmSettings(device, map, 'fun_auto_set', Number(autoInput.enabled)),
+          physicalEffectVerified: false, freshnessVerified: false,
+        };
+      } else if (powerLevelInput !== undefined && typeof powerLevelInput.level === 'number') {
+        const { device, map } = await discoverRegisterMap(client, config.deviceId);
+        const initialReading = await client.readBuffer(device, 1);
+        const preview = previewPowerLevel(device, map, initialReading, powerLevelInput.level);
+        await client.testPowerLevel(device, map, initialReading, powerLevelInput.level);
+        result = {
+          originalLevel: preview.originalLevel, requestedLevel: powerLevelInput.level,
+          before: preview.settings, ...await confirmSettings(device, map, 'power_set', powerLevelInput.level),
+          physicalEffectVerified: false, freshnessVerified: false,
+        };
+      } else if (ventilationInput !== undefined && typeof ventilationInput.level === 'number') {
+        const { device, map } = await discoverRegisterMap(client, config.deviceId);
+        const initialReading = await client.readBuffer(device, 1);
+        const preview = previewFrontVentilation(device, map, initialReading, ventilationInput.level);
+        await client.testFrontVentilation(device, map, initialReading, ventilationInput.level);
+        result = {
+          originalLevel: preview.originalLevel, requestedLevel: ventilationInput.level,
+          before: preview.settings, ...await confirmSettings(device, map, 'vent_front_set', ventilationInput.level),
+          physicalEffectVerified: false, freshnessVerified: false,
+        };
+      } else if (powerInput !== undefined && (powerInput.action === 'on' || powerInput.action === 'off')) {
+        const { device, map } = await discoverRegisterMap(client, config.deviceId);
+        const initialReading = await client.readBuffer(device, 1);
+        const before = observeNobisStatus(map, initialReading);
+        await client.testPower(device, map, initialReading, powerInput.action);
+        const after = observeNobisStatus(map, await client.readBuffer(device, 1));
+        result = {
+          action: powerInput.action, mask: 255, before, after,
+          physicalEffectVerified: false, freshnessVerified: false,
+        };
+      } else if (writeInput !== undefined && typeof writeInput.celsius === 'number') {
+        const { device, map } = await discoverRegisterMap(client, config.deviceId);
+        const before = await client.readBuffer(device, 1);
+        const initial = decodeSetpoint(map, before);
+        if (initial.mode !== 'temperature') {
+          throw new AguaError('protocol', 'setpoint-original');
+        }
+        const original = initial.celsius;
+        await client.testSetpoint(device, map, writeInput.celsius);
+        const activeClient = client;
+        const confirmation = await confirmSetpoint(
+          () => activeClient.readBuffer(device, 1), writeInput.celsius, deadline.signal,
+        );
+        result = {
+          originalCelsius: original, requestedCelsius: writeInput.celsius,
+          ...confirmation, freshnessVerified: false,
+        };
+      } else if (request.url === '/settings-read') {
+        const { device, map } = await discoverRegisterMap(client, config.deviceId);
+        const reading = await client.readBuffer(device, 1);
+        result = { bufferId: 1, settings: observeOperatingSettings(map, reading) };
+      } else if (request.url === '/status-read') {
+        const { device, map } = await discoverRegisterMap(client, config.deviceId);
+        const reading = await client.readBuffer(device, 1);
+        result = { bufferId: 1, status: observeNobisStatus(map, reading) };
+      } else if (request.url === '/setpoint-read') {
+        const { device, map } = await discoverRegisterMap(client, config.deviceId);
+        const reading = await client.readBuffer(device, 1);
+        result = { bufferId: 1, setpoint: decodeSetpoint(map, reading) };
+      } else if (request.url === '/ambient-temperature') {
         const { device, map } = await discoverRegisterMap(client, config.deviceId);
         const reading = await client.readBuffer(device, 1);
         result = { bufferId: 1, temperature: decodeNobisAmbientTemperature(map, reading, 1) };
@@ -187,6 +355,32 @@ export async function startDiagnosticBrowser(
       response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       response.end(JSON.stringify(result));
     } catch (error) {
+      if (request.url === '/auto-test' || request.url === '/powerful-test') {
+        const failure = safeFailure(deadline.signal.aborted
+          ? new AguaError('timeout', request.url === '/auto-test' ? 'auto-test' : 'powerful-test') : error);
+        throw new RequestError(failure.status, `${failure.error}`
+          + ' Verifiez Auto, Powerful, puissance et ventilation dans Nobis-Fi.'
+          + ' Une commande peut avoir ete appliquee ; aucune repetition ni restauration automatiques.');
+      }
+      if (request.url === '/ventilation-test' || request.url === '/power-level-test') {
+        const failure = safeFailure(deadline.signal.aborted
+          ? new AguaError('timeout', request.url === '/ventilation-test' ? 'ventilation-test' : 'power-level-test') : error);
+        throw new RequestError(failure.status, `${failure.error}`
+          + ' Verifiez Nobis-Fi et restaurez le niveau initial si necessaire.'
+          + ' Effet physique non confirme ; aucune repetition ni restauration automatiques.');
+      }
+      if (request.url === '/power-test') {
+        const failure = safeFailure(deadline.signal.aborted ? new AguaError('timeout', 'power-test') : error);
+        throw new RequestError(failure.status, `${failure.error}`
+          + ' Effet physique non confirme : verifiez la telecommande et Nobis-Fi.'
+          + ' Aucune repetition, commande inverse ni changement de masque automatiques.');
+      }
+      if (request.url === '/setpoint-test') {
+        const failure = safeFailure(deadline.signal.aborted ? new AguaError('timeout', 'setpoint-test') : error);
+        throw new RequestError(failure.status, `${failure.error}`
+          + ' Le resultat physique peut etre indetermine : verifiez et restaurez la consigne dans Nobis-Fi.'
+          + ' Aucune repetition ni restauration automatique.');
+      }
       throw deadline.signal.aborted ? new AguaError('timeout', 'browser-discovery') : error;
     } finally {
       clearTimeout(timer);

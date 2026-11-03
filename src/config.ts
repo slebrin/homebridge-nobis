@@ -15,6 +15,15 @@ export interface NobisConfig {
   readonly diagnostic: boolean;
   readonly enableCloud: boolean;
   readonly enableTemperatureSensor: boolean;
+  readonly enablePowerSwitch: boolean;
+  readonly enableSetpointControl: boolean;
+  readonly enableVentilationControl: boolean;
+  readonly enablePowerfulControl: boolean;
+  readonly enableAutoControl: boolean;
+  readonly confirmAbandonPendingCommands: boolean;
+  readonly useHeatingActivityIndicator: boolean;
+  readonly enableChronoControl: boolean;
+  readonly enableEcoStopSensor: boolean;
 }
 
 export class ConfigError extends Error {
@@ -45,6 +54,15 @@ export function parseConfig(input: unknown): NobisConfig {
   const diagnostic = input.diagnostic === undefined ? false : input.diagnostic;
   const enableCloud = input.enableCloud === undefined ? false : input.enableCloud;
   const enableTemperatureSensor = input.enableTemperatureSensor === undefined ? false : input.enableTemperatureSensor;
+  const enablePowerSwitch = input.enablePowerSwitch === undefined ? false : input.enablePowerSwitch;
+  const enableSetpointControl = input.enableSetpointControl === undefined ? false : input.enableSetpointControl;
+  const enableVentilationControl = input.enableVentilationControl === undefined ? false : input.enableVentilationControl;
+  const enablePowerfulControl = input.enablePowerfulControl === undefined ? false : input.enablePowerfulControl;
+  const enableAutoControl = input.enableAutoControl === undefined ? false : input.enableAutoControl;
+  const confirmAbandonPendingCommands = input.confirmAbandonPendingCommands === undefined ? false : input.confirmAbandonPendingCommands;
+  const useHeatingActivityIndicator = input.useHeatingActivityIndicator === undefined ? false : input.useHeatingActivityIndicator;
+  const enableChronoControl = input.enableChronoControl === undefined ? false : input.enableChronoControl;
+  const enableEcoStopSensor = input.enableEcoStopSensor === undefined ? false : input.enableEcoStopSensor;
 
   if (!nonEmptyString(email) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
     fields.push('email');
@@ -69,6 +87,33 @@ export function parseConfig(input: unknown): NobisConfig {
     || (enableTemperatureSensor && !enableCloud)) {
     fields.push('enableTemperatureSensor');
   }
+  if (typeof enablePowerSwitch !== 'boolean' || (enablePowerSwitch && (!enableCloud || !enableTemperatureSensor))) {
+    fields.push('enablePowerSwitch');
+  }
+  if (typeof enableSetpointControl !== 'boolean' || (enableSetpointControl && !enablePowerSwitch)) {
+    fields.push('enableSetpointControl');
+  }
+  if (typeof enableVentilationControl !== 'boolean' || (enableVentilationControl && !enableSetpointControl)) {
+    fields.push('enableVentilationControl');
+  }
+  if (typeof enablePowerfulControl !== 'boolean' || (enablePowerfulControl && !enablePowerSwitch)) {
+    fields.push('enablePowerfulControl');
+  }
+  if (typeof enableAutoControl !== 'boolean' || (enableAutoControl && !enablePowerSwitch)) {
+    fields.push('enableAutoControl');
+  }
+  if (typeof confirmAbandonPendingCommands !== 'boolean' || (confirmAbandonPendingCommands && !enablePowerSwitch)) {
+    fields.push('confirmAbandonPendingCommands');
+  }
+  if (typeof useHeatingActivityIndicator !== 'boolean' || (useHeatingActivityIndicator && !enableSetpointControl)) {
+    fields.push('useHeatingActivityIndicator');
+  }
+  if (typeof enableChronoControl !== 'boolean' || (enableChronoControl && !enablePowerSwitch)) {
+    fields.push('enableChronoControl');
+  }
+  if (typeof enableEcoStopSensor !== 'boolean' || (enableEcoStopSensor && !enableTemperatureSensor)) {
+    fields.push('enableEcoStopSensor');
+  }
   for (const field of ['stoveName', 'deviceId'] as const) {
     if (input[field] !== undefined && !nonEmptyString(input[field])) {
       fields.push(field);
@@ -77,7 +122,12 @@ export function parseConfig(input: unknown): NobisConfig {
 
   if (fields.length > 0 || !nonEmptyString(email) || !nonEmptyString(password)
     || !nonEmptyString(name) || typeof interval !== 'number' || typeof diagnostic !== 'boolean'
-    || typeof enableCloud !== 'boolean' || typeof enableTemperatureSensor !== 'boolean') {
+    || typeof enableCloud !== 'boolean' || typeof enableTemperatureSensor !== 'boolean'
+    || typeof enablePowerSwitch !== 'boolean' || typeof enableSetpointControl !== 'boolean'
+    || typeof enableVentilationControl !== 'boolean' || typeof enablePowerfulControl !== 'boolean'
+    || typeof enableAutoControl !== 'boolean' || typeof confirmAbandonPendingCommands !== 'boolean'
+    || typeof useHeatingActivityIndicator !== 'boolean' || typeof enableChronoControl !== 'boolean'
+    || typeof enableEcoStopSensor !== 'boolean') {
     throw new ConfigError(fields);
   }
 
@@ -89,6 +139,15 @@ export function parseConfig(input: unknown): NobisConfig {
     diagnostic,
     enableCloud,
     enableTemperatureSensor,
+    enablePowerSwitch,
+    enableSetpointControl,
+    enableVentilationControl,
+    enablePowerfulControl,
+    enableAutoControl,
+    confirmAbandonPendingCommands,
+    useHeatingActivityIndicator,
+    enableChronoControl,
+    enableEcoStopSensor,
     ...(nonEmptyString(input.stoveName) ? { stoveName: input.stoveName.trim() } : {}),
     ...(nonEmptyString(input.deviceId) ? { deviceId: input.deviceId.trim() } : {}),
   });

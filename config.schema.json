@@ -7,18 +7,156 @@
     "type": "object",
     "required": ["email", "password", "pollIntervalSeconds"],
     "additionalProperties": false,
+    "allOf": [
+      {
+        "if": { "required": ["enableEcoStopSensor"], "properties": { "enableEcoStopSensor": { "const": true } } },
+        "then": {
+          "required": ["enableCloud", "enableTemperatureSensor"],
+          "properties": { "enableCloud": { "const": true }, "enableTemperatureSensor": { "const": true } }
+        }
+      },
+      {
+        "if": { "required": ["enableChronoControl"], "properties": { "enableChronoControl": { "const": true } } },
+        "then": {
+          "required": ["enableCloud", "enableTemperatureSensor", "enablePowerSwitch"],
+          "properties": {
+            "enableCloud": { "const": true }, "enableTemperatureSensor": { "const": true },
+            "enablePowerSwitch": { "const": true }
+          }
+        }
+      },
+      {
+        "if": { "required": ["useHeatingActivityIndicator"], "properties": { "useHeatingActivityIndicator": { "const": true } } },
+        "then": {
+          "required": ["enableCloud", "enableTemperatureSensor", "enablePowerSwitch", "enableSetpointControl"],
+          "properties": {
+            "enableCloud": { "const": true }, "enableTemperatureSensor": { "const": true },
+            "enablePowerSwitch": { "const": true }, "enableSetpointControl": { "const": true }
+          }
+        }
+      },
+      {
+        "if": { "required": ["confirmAbandonPendingCommands"], "properties": { "confirmAbandonPendingCommands": { "const": true } } },
+        "then": {
+          "required": ["enableCloud", "enableTemperatureSensor", "enablePowerSwitch"],
+          "properties": {
+            "enableCloud": { "const": true }, "enableTemperatureSensor": { "const": true },
+            "enablePowerSwitch": { "const": true }
+          }
+        }
+      },
+      {
+        "if": { "required": ["enableAutoControl"], "properties": { "enableAutoControl": { "const": true } } },
+        "then": {
+          "required": ["enableCloud", "enableTemperatureSensor", "enablePowerSwitch"],
+          "properties": {
+            "enableCloud": { "const": true }, "enableTemperatureSensor": { "const": true },
+            "enablePowerSwitch": { "const": true }
+          }
+        }
+      },
+      {
+        "if": { "required": ["enablePowerfulControl"], "properties": { "enablePowerfulControl": { "const": true } } },
+        "then": {
+          "required": ["enableCloud", "enableTemperatureSensor", "enablePowerSwitch"],
+          "properties": {
+            "enableCloud": { "const": true }, "enableTemperatureSensor": { "const": true },
+            "enablePowerSwitch": { "const": true }
+          }
+        }
+      },
+      {
+        "if": { "required": ["enableTemperatureSensor"], "properties": { "enableTemperatureSensor": { "const": true } } },
+        "then": { "required": ["enableCloud"], "properties": { "enableCloud": { "const": true } } }
+      },
+      {
+        "if": { "required": ["enablePowerSwitch"], "properties": { "enablePowerSwitch": { "const": true } } },
+        "then": {
+          "required": ["enableCloud", "enableTemperatureSensor"],
+          "properties": { "enableCloud": { "const": true }, "enableTemperatureSensor": { "const": true } }
+        }
+      },
+      {
+        "if": { "required": ["enableSetpointControl"], "properties": { "enableSetpointControl": { "const": true } } },
+        "then": {
+          "required": ["enableCloud", "enableTemperatureSensor", "enablePowerSwitch"],
+          "properties": {
+            "enableCloud": { "const": true }, "enableTemperatureSensor": { "const": true },
+            "enablePowerSwitch": { "const": true }
+          }
+        }
+      },
+      {
+        "if": { "required": ["enableVentilationControl"], "properties": { "enableVentilationControl": { "const": true } } },
+        "then": {
+          "required": ["enableCloud", "enableTemperatureSensor", "enablePowerSwitch", "enableSetpointControl"],
+          "properties": {
+            "enableCloud": { "const": true }, "enableTemperatureSensor": { "const": true },
+            "enablePowerSwitch": { "const": true }, "enableSetpointControl": { "const": true }
+          }
+        }
+      }
+    ],
     "properties": {
-      "enableCloud": {
-        "title": "Enable read-only cloud discovery",
+      "enableEcoStopSensor": {
+        "title": "Enable read-only Eco Stop contact sensor",
         "type": "boolean",
         "default": false,
-        "description": "Reads devices and register definitions. Buffer readings require the separate temperature sensor option. No stove control."
+        "description": "Adds one contact sensor on the same stove, not a switch. Open means API phase ECO STOP; closed means another recognized phase, not proof that the stove is OFF. Unknown phase or failed reading is unavailable. Requires cloud and temperature reading, not power control. Uses existing reads; cloud freshness unknown and updates follow polling. No stove commands. Apple Home uses open/closed labels; grouping and summary display depend on Home."
+      },
+      "enableChronoControl": {
+        "title": "Enable experimental Chrono (scheduled programs) switch",
+        "type": "boolean",
+        "default": false,
+        "description": "Requires cloud, ambient reading and power control. Adds Chrono on the same stove. Reading 33162 OFF=0/ON=1 compared with Nobis-Fi on the A8; user reports Programme switch working in Home, not schedule execution or all phases validated. Writes allowed in OFF/ECO STOP, with no Auto/Powerful condition. User confirms Nobis-Fi allows changes in ECO STOP; plugin writes in this phase still require hardware confirmation. TRAVAIL remains excluded as a precaution, not a proven manufacturer restriction. Enabling can allow automatic starts/stops from EXISTING schedules: inspect all schedules before use. Writes only enable flag 33162/65535, once, no schedule editing or immediate power command, no retry/restore. Pending target persists and blocks all writes until readback or explicit recovery. Cloud freshness unknown. Disabled by default; no unattended HomeKit automations."
+      },
+      "useHeatingActivityIndicator": {
+        "title": "Use heating tile for ON/OFF and switch as En chauffe indicator",
+        "type": "boolean",
+        "default": false,
+        "description": "Requires the heating tile and all its prerequisites. Changes the EXISTING power switch into an observation-only indicator: ON only for API-confirmed TRAVAIL, OFF for OFF/ECO STOP/DEBUT/ARRET, unavailable for unknown phases or cloud errors. OFF means no confirmed TRAVAIL, not proof of no flame/residual heat. Clicks on the indicator are refused and send no command. Real ON/OFF remains on the heating tile: HEAT from OFF, OFF from TRAVAIL/ECO STOP. UUID and service subtype unchanged: review existing switch automations BEFORE enabling, since their meaning changes; Apple Home may retain your custom name and use Allume/Eteint labels. Disable to restore the previous power switch. No unattended automations."
+      },
+      "confirmAbandonPendingCommands": {
+        "title": "Confirm one-time abandonment of ALL pending commands",
+        "type": "boolean",
+        "default": false,
+        "description": "Recovery only, not stove control. Stop the stove in Nobis-Fi or using its remote first. Enabling this option and restarting confirms abandonment of ALL stored power/setpoint/ventilation/Auto/Powerful/Chrono targets for the selected stove, including disabled controls. Requires cloud, temperature reading and power enabled, a valid API reading reporting OFF and valid settings. Sends no stove command, does not disable schedules and does not cancel an earlier cloud command, which may still execute later; freshness is unknown. Confirmation is durably consumed once even if no target exists; leaving it enabled does NOT clear future targets or repeat on restart. Afterwards disable, save and restart to re-arm for a future explicit confirmation. Corrupt storage or failed reads are not bypassed."
+      },
+      "enableAutoControl": {
+        "title": "Enable experimental Auto switch",
+        "type": "boolean",
+        "default": false,
+        "description": "Requires cloud, temperature sensor and power switch. Adds Nobis Auto mode on the same stove, not stove activation or HomeKit automatic heating/cooling. Auto regulates power and ventilation. ON/OFF reported confirmed in Nobis-Fi via diagnostic; freshness and physical output unknown. Writes only 33128, once, with Powerful OFF and phase OFF/TRAVAIL/ECO STOP. User confirms Nobis-Fi allows changes in ECO STOP; plugin writes in this phase still require hardware confirmation. No Powerful change, stove activation, retry or restoration. Pending target blocks all controls, survives restart and option removal until API readback. Supervised use only; no unattended automations."
+      },
+      "enablePowerfulControl": {
+        "title": "Enable experimental Powerful switch",
+        "type": "boolean",
+        "default": false,
+        "description": "Requires cloud, temperature sensor and power switch. Adds a separate Powerful mode switch on the same stove, not an ON/OFF stove control. ON/OFF tested with Nobis-Fi on the target A8; physical output and cloud freshness unknown. Writes only 33154, once, with Auto OFF and phase OFF/TRAVAIL/ECO STOP; CRONO excluded. User confirms Nobis-Fi allows changes in ECO STOP; plugin writes in this phase still require hardware confirmation. No Auto change, stove activation, retry or restoration sent by the plugin. Powerful may itself change power/ventilation. A pending target blocks all writes and survives restart, including when this option is disabled. Supervised use only; no unattended automations."
+      },
+      "enableCloud": {
+        "title": "Enable Nobis-Fi cloud connection",
+        "type": "boolean",
+        "default": false,
+        "description": "Required for every other option. Alone, reads devices and register definitions only. Buffer readings and real commands require their separate opt-ins below."
       },
       "enableTemperatureSensor": {
-        "title": "Expose experimental read-only temperature sensor",
+        "title": "Enable experimental ambient temperature reading",
         "type": "boolean",
         "default": false,
-        "description": "Requires cloud discovery enabled. Reads buffer 1 periodically and exposes only the validated temp_air2_get profile. Cloud measurement freshness is unknown, especially if the thermostat remote is disconnected. No heating state or control."
+        "description": "Requires cloud discovery enabled. Reads buffer 1 periodically using the validated temp_air2_get profile. Required for controls. Shows a separate ambient tile only when the heating tile is disabled; otherwise ambient temperature is displayed in heating. No change to stove identity. Cloud measurement freshness is unknown, especially if the thermostat remote is disconnected. This option alone sends no commands."
+      },
+      "enablePowerSwitch": {
+        "title": "Enable experimental real stove power control",
+        "type": "boolean",
+        "default": false,
+        "description": "Requires cloud and temperature sensor enabled. Sends real ON/OFF commands using the A8 profile tested manually. ON only from OFF; OFF from TRAVAIL or ECO STOP. All Home controls respond on LOCAL acceptance, not cloud acceptance or stove confirmation, retaining last observed values until API readback. Later failures are logged and cannot be returned to the original Home request. Other writes remain locked during processing or pending readback. Known transitions retain the last confirmed activation and refuse writes; unknown activation remains unavailable. Up to three paced readbacks, then normal polling; no write retry. Pending state survives restart until its target phase is read. Cloud freshness is unknown: supervise use, follow manufacturer instructions, and do not use unattended automations."
+      },
+      "enableSetpointControl": {
+        "title": "Enable experimental heating tile and temperature setpoint",
+        "type": "boolean",
+        "default": false,
+        "description": "Requires the experimental power switch, cloud and temperature sensor. Adds a heating-only Thermostat, retaining the switch. Apple Home setpoint slider remains disabled while the stove is OFF on the tested installation; use Nobis-Fi for adjustments while OFF. Never choose HEAT just to unlock a slider: it turns the stove on. Setpoint 7–40 Celsius, integer steps. MAN blocks this tile. Transitions are unavailable. ECO STOP retains activation and allows OFF, not setpoint changes. Real commands, no retry or restoration. Pending setpoints persist until target readback and block all writes. Supervised use only."
       },
       "name": {
         "title": "Platform name",
@@ -26,6 +164,12 @@
         "default": "Nobis",
         "minLength": 1,
         "pattern": "\\S"
+      },
+      "enableVentilationControl": {
+        "title": "Enable experimental HeaterCooler with front ventilation",
+        "type": "boolean",
+        "default": false,
+        "description": "Requires cloud, temperature sensor, power switch and setpoint enabled. Replaces Thermostat with heating-only HeaterCooler on the same accessory. RotationSpeed normalizes requested Nobis levels 1-7 to 14/29/43/57/71/86/100%, NOT measured airflow. Arbitrary positive percentages round to nearest level. Actual OFF/0 is readable, but OFF and PS writes are refused; PS has no numeric speed. Auto/Powerful must be OFF and phase OFF/TRAVAIL for writes. No fan-only ON/OFF: Active controls the stove. Writes once, no retry/restore; persistent pending target blocks writes, not valid reads, until API readback. Apple Home slider presence confirmed, but disabled while OFF; actual control from Apple Home remains to be validated. Power level is not exposed in Apple Home. Auto and Powerful have separate opt-ins. Supervised use only."
       },
       "email": {
         "title": "Nobis-Fi email",
@@ -68,15 +212,15 @@
         "title": "Safe diagnostic logging",
         "type": "boolean",
         "default": false,
-        "description": "Operation timings and safe error codes. Never includes credentials, tokens or raw responses."
+        "description": "Operation timings and safe error codes. With the temperature sensor enabled, also logs changes in two selected numeric status codes from the same buffer reading. Unknown codes remain unknown; no heating state is inferred. Never includes credentials, tokens, device IDs, map labels or complete raw responses."
       }
     }
   },
   "layout": [
     {
       "type": "section",
-      "title": "Experimental read-only validation — no stove control",
-      "items": ["enableCloud", "enableTemperatureSensor", "name", "email", { "key": "password", "type": "password" }, "stoveName", "deviceId", { "key": "pollIntervalSeconds", "type": "number" }, "diagnostic"]
+      "title": "Experimental Nobis integration — control disabled by default",
+      "items": ["enableCloud", "enableTemperatureSensor", "enableEcoStopSensor", "enablePowerSwitch", "enableSetpointControl", "enableVentilationControl", "enablePowerfulControl", "enableAutoControl", "enableChronoControl", "useHeatingActivityIndicator", "name", "email", { "key": "password", "type": "password" }, "stoveName", "deviceId", { "key": "pollIntervalSeconds", "type": "number" }, "diagnostic", "confirmAbandonPendingCommands"]
     }
   ]
 }

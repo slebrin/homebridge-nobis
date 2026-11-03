@@ -7,6 +7,13 @@ import { deviceReference, devices, integer, jobReading, list, record, registers,
 import type { AguaDevice, DeviceReference, RawReading, RegisterMap } from './models.js';
 import { AguaTransport } from './transport.js';
 import type { AguaPath, TransportOptions } from './transport.js';
+import { previewSetpoint } from './command-preview.js';
+import { previewPower } from './power-preview.js';
+import type { PowerAction } from './power-preview.js';
+import { previewFrontVentilation } from './ventilation-preview.js';
+import { previewPowerLevel } from './power-level-preview.js';
+import { previewAuto, previewPowerful } from './auto-preview.js';
+import { previewChrono } from './chrono.js';
 
 export interface ClientOptions extends TransportOptions {
   readonly jobTimeoutMs?: number;
@@ -23,8 +30,23 @@ export class AguaClient {
   private readonly pendingBufferConfigs = new Map<string, Promise<Record<string, unknown>>>();
   private readonly jobTimeoutMs: number;
   private readonly jobPollIntervalMs: number;
+  private readonly enableExperimentalSetpoint: boolean;
+  private readonly enableExperimentalPower: boolean;
+  private readonly enableExperimentalVentilation: boolean;
+  private readonly enableExperimentalPowerLevel: boolean;
+  private readonly enableExperimentalAuto: boolean;
+  private readonly enableExperimentalPowerful: boolean;
+  private readonly enableExperimentalChrono: boolean;
+  private writing = false;
 
   constructor(credentials: Credentials, options: ClientOptions = {}) {
+    this.enableExperimentalSetpoint = options.enableExperimentalSetpoint === true;
+    this.enableExperimentalPower = options.enableExperimentalPower === true;
+    this.enableExperimentalVentilation = options.enableExperimentalVentilation === true;
+    this.enableExperimentalPowerLevel = options.enableExperimentalPowerLevel === true;
+    this.enableExperimentalAuto = options.enableExperimentalAuto === true;
+    this.enableExperimentalPowerful = options.enableExperimentalPowerful === true;
+    this.enableExperimentalChrono = options.enableExperimentalChrono === true;
     this.jobTimeoutMs = options.jobTimeoutMs ?? 30_000;
     this.jobPollIntervalMs = options.jobPollIntervalMs ?? 1000;
     if (!Number.isSafeInteger(this.jobTimeoutMs) || this.jobTimeoutMs <= 0 || this.jobTimeoutMs > 2_147_483_647
@@ -81,6 +103,91 @@ export class AguaClient {
     return this.inspectBufferMetadata(device, '/devicegetBufferId');
   }
 
+  async testSetpoint(device: DeviceReference, map: RegisterMap, celsius: number): Promise<void> {
+    if (!this.enableExperimentalSetpoint || this.writing) {
+      throw new AguaError('configuration', 'setpoint-test');
+    }
+    const preview = previewSetpoint(device, map, celsius);
+    await this.writeOnce(preview.body, 'setpoint-test');
+  }
+
+  async testPower(device: DeviceReference, map: RegisterMap, reading: RawReading, action: PowerAction): Promise<void> {
+    if (!this.enableExperimentalPower || this.writing) {
+      throw new AguaError('configuration', 'power-test');
+    }
+    const preview = previewPower(device, map, reading, action);
+    await this.writeOnce(preview.body, 'power-test');
+  }
+
+  async testFrontVentilation(device: DeviceReference, map: RegisterMap, reading: RawReading, level: number): Promise<void> {
+    if (!this.enableExperimentalVentilation || this.writing) {
+      throw new AguaError('configuration', 'ventilation-test');
+    }
+    const preview = previewFrontVentilation(device, map, reading, level);
+    if (preview.originalLevel === level) {
+      throw new AguaError('configuration', 'ventilation-unchanged');
+    }
+    await this.writeOnce(preview.body, 'ventilation-test');
+  }
+
+  async testPowerLevel(device: DeviceReference, map: RegisterMap, reading: RawReading, level: number): Promise<void> {
+    if (!this.enableExperimentalPowerLevel || this.writing) {
+      throw new AguaError('configuration', 'power-level-test');
+    }
+    const preview = previewPowerLevel(device, map, reading, level);
+    if (preview.originalLevel === level) {
+      throw new AguaError('configuration', 'power-level-unchanged');
+    }
+    await this.writeOnce(preview.body, 'power-level-test');
+  }
+
+  async testAuto(device: DeviceReference, map: RegisterMap, reading: RawReading, enabled: boolean): Promise<void> {
+    if (!this.enableExperimentalAuto || this.writing) {
+      throw new AguaError('configuration', 'auto-test');
+    }
+    await this.writeOnce(previewAuto(device, map, reading, enabled).body, 'auto-test');
+  }
+
+  async testPowerful(device: DeviceReference, map: RegisterMap, reading: RawReading, enabled: boolean): Promise<void> {
+    if (!this.enableExperimentalPowerful || this.writing) {
+      throw new AguaError('configuration', 'powerful-test');
+    }
+    await this.writeOnce(previewPowerful(device, map, reading, enabled).body, 'powerful-test');
+  }
+
+  async testChrono(device: DeviceReference, map: RegisterMap, reading: RawReading, enabled: boolean): Promise<void> {
+    if (!this.enableExperimentalChrono || this.writing) {
+      throw new AguaError('configuration', 'chrono-test');
+    }
+    await this.writeOnce(previewChrono(device, map, reading, enabled).body, 'chrono-test');
+  }
+
+  private async writeOnce(body: object, operation: 'setpoint-test' | 'power-test' | 'ventilation-test' | 'power-level-test' | 'auto-test' | 'powerful-test' | 'chrono-test'): Promise<void> {
+    this.writing = true;
+    try {
+      await this.runJob('/deviceRequestWriting', body, operation, response => {
+        const state = text(response.jobAnswerStatus, 'deviceJobStatus');
+        if (state === 'waiting') {
+          return undefined;
+        }
+        if (state === 'terminated' || state === 'Missing job' || state === 'Missing job answer') {
+          throw new AguaJobUnavailableError(state);
+        }
+        if (state !== 'completed') {
+          throw new AguaError('protocol', operation);
+        }
+        const data = record(response.jobAnswerData, operation);
+        if ('NackErrCode' in data) {
+          throw new AguaError('unavailable', operation);
+        }
+        // Completion permits a separate read, not an optimistic state update.
+        return true;
+      });
+    } finally {
+      this.writing = false;
+    }
+  }
+
   private inspectBufferMetadata(
     device: DeviceReference,
     path: '/deviceGetConfigBuffer' | '/devicegetBufferId',
@@ -104,7 +211,7 @@ export class AguaClient {
   }
 
   private async runJob<T>(
-    path: '/deviceGetBufferReading' | '/deviceGetConfigBuffer' | '/devicegetBufferId',
+    path: '/deviceGetBufferReading' | '/deviceGetConfigBuffer' | '/devicegetBufferId' | '/deviceRequestWriting',
     body: object,
     operation: string,
     parse: (response: Record<string, unknown>) => T | undefined,
@@ -148,7 +255,8 @@ export class AguaClient {
     try {
       return await send(token);
     } catch (error) {
-      if (!(error instanceof AguaError) || error.kind !== 'http' || error.status !== 401
+      if (path === '/deviceRequestWriting'
+        || !(error instanceof AguaError) || error.kind !== 'http' || error.status !== 401
         || signal?.aborted || this.shutdown.signal.aborted) {
         throw error;
       }
